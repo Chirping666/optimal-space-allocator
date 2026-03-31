@@ -6,3 +6,5 @@
 
 - **Guard `align_up` against `align == 0`**: Added `debug_assert!(align.is_power_of_two())` precondition to `align_up`. This catches `align == 0` (which would cause `0 - 1 = usize::MAX` and silently return 0) in debug builds. All 17 tests pass.
 
+- **Add `Send` safety comment**: Added an explicit comment next to the `Sync` impl explaining why `Send` is also safe: all fields are `Send`, no thread-local state is referenced, and the spin lock ensures sound access from any thread.
+

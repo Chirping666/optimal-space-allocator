@@ -63,6 +63,11 @@ pub struct Allocator<const N: usize> {
 // spin lock, ensuring mutual exclusion across threads.
 unsafe impl<const N: usize> Sync for Allocator<N> {}
 
+// SAFETY: `Send` is auto-derived because all fields (`UnsafeCell<[u8; N]>`,
+// `UnsafeCell<usize>`, `AtomicBool`) are `Send`. Transferring an `Allocator`
+// to another thread is safe: no thread-local state is referenced, and the spin
+// lock ensures sound access from whichever thread owns or shares the value.
+
 /// Compute how many body bytes a block at `off` actually occupies,
 /// given the user's `size` and `align` and the buffer base address.
 #[inline]
