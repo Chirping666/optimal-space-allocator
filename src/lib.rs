@@ -6,13 +6,14 @@ use core::cell::UnsafeCell;
 use core::ptr;
 
 const NONE: usize = usize::MAX;
-const HEADER: usize = size_of::<[usize; 2]>();
+/// Per-block header: `[size, align, next]`.
+const HEADER: usize = size_of::<[usize; 3]>();
 
 /// Best-fit allocator over a fixed `[u8; N]` buffer.
 ///
-/// Only *allocated* blocks carry inline `[length, next]` headers, kept sorted
-/// by offset. Free space is implicit: every gap between allocated blocks.
-/// Freeing a block simply unlinks it — no coalescing required.
+/// Only *allocated* blocks carry inline `[size, align, next]` headers, kept
+/// sorted by offset. Free space is implicit: every gap between allocated
+/// blocks. Freeing a block simply unlinks it — no coalescing required.
 pub struct Allocator<const N: usize> {
     data: UnsafeCell<[u8; N]>,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].
@@ -22,11 +23,25 @@ pub struct Allocator<const N: usize> {
 // SAFETY: GlobalAlloc contract requires callers to synchronise.
 unsafe impl<const N: usize> Sync for Allocator<N> {}
 
+/// Compute how many body bytes a block at `off` actually occupies,
+/// given the user's `size` and `align` and the buffer base address.
+#[inline]
+fn body_len(base: usize, off: usize, size: usize, align: usize) -> usize {
+    let raw = base + off + HEADER;
+    let padding = align_up(raw, align) - raw;
+    align_up(size + padding, size_of::<usize>())
+}
+
+#[inline]
+const fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
+}
+
 impl<const N: usize> Allocator<N> {
     pub const fn new() -> Self {
         Self {
             data: UnsafeCell::new([0; N]),
-            head: UnsafeCell::new(NONE), // no allocations → entire buffer is free
+            head: UnsafeCell::new(NONE),
         }
     }
 
@@ -42,17 +57,15 @@ impl<const N: usize> Allocator<N> {
         *self.head.get() = v;
     }
 
-    /// Read the `[length, next]` header at byte offset `off`.
-    unsafe fn get(&self, off: usize) -> [usize; 2] {
-        ptr::read(self.buf().add(off) as *const [usize; 2])
+    unsafe fn get(&self, off: usize) -> [usize; 3] {
+        ptr::read(self.buf().add(off) as *const [usize; 3])
     }
 
-    /// Write a `[length, next]` header at byte offset `off`.
-    unsafe fn set(&self, off: usize, h: [usize; 2]) {
-        ptr::write(self.buf().add(off) as *mut [usize; 2], h);
+    unsafe fn set(&self, off: usize, h: [usize; 3]) {
+        ptr::write(self.buf().add(off) as *mut [usize; 3], h);
     }
 
-    /// Try to fit an allocation of `size` bytes at `align` into a gap.
+    /// Try to fit `size` bytes at `align` into the gap `[gap_start, gap_end)`.
     /// Returns `(body_len, waste)` on success.
     unsafe fn fit_gap(
         &self,
@@ -65,17 +78,56 @@ impl<const N: usize> Allocator<N> {
         if gap < HEADER {
             return None;
         }
-        let raw = self.buf().add(gap_start + HEADER) as usize;
-        let padding = align_up(raw, align) - raw;
-        let body = align_up(size + padding, size_of::<usize>());
+        let body = body_len(self.buf() as usize, gap_start, size, align);
         let needed = HEADER + body;
         (needed <= gap).then(|| (body, gap - needed))
     }
-}
 
-#[inline]
-const fn align_up(v: usize, align: usize) -> usize {
-    (v + align - 1) & !(align - 1)
+    /// Compact all allocated blocks toward the start of the buffer,
+    /// eliminating fragmentation. Calls `relocate(old_ptr, new_ptr)` for
+    /// every block whose user pointer changed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must update **all** live pointers via the `relocate`
+    /// callback. Any pointer not updated becomes dangling.
+    pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
+        let base = self.buf();
+        let base_addr = base as usize;
+        let mut target: usize = 0; // next available offset
+        let mut prev = NONE;
+        let mut cur = self.head();
+
+        while cur != NONE {
+            let [size, align, next] = self.get(cur);
+            let new_body = body_len(base_addr, target, size, align);
+
+            if target < cur {
+                let old_user = align_up(base_addr + cur + HEADER, align) as *mut u8;
+                let new_user = align_up(base_addr + target + HEADER, align) as *mut u8;
+
+                // Copy user data to new position (ptr::copy handles overlap).
+                ptr::copy(old_user, new_user, size);
+
+                self.set(target, [size, align, next]);
+
+                if prev == NONE {
+                    self.set_head(target);
+                } else {
+                    let [ps, pa, _] = self.get(prev);
+                    self.set(prev, [ps, pa, target]);
+                }
+
+                relocate(old_user, new_user);
+                prev = target;
+            } else {
+                prev = cur;
+            }
+
+            target = (if target < cur { target } else { cur }) + HEADER + new_body;
+            cur = next;
+        }
+    }
 }
 
 unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
@@ -84,7 +136,6 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
         let align = layout.align();
         let base = self.buf();
 
-        // Walk the sorted allocated list, evaluating every gap.
         let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
         let mut best_waste = usize::MAX;
 
@@ -103,36 +154,34 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
                 }
             }
 
-            let [len, next] = self.get(cur);
+            let [sz, al, next] = self.get(cur);
             prev = cur;
-            gap_start = cur + HEADER + len;
+            gap_start = cur + HEADER + body_len(base as usize, cur, sz, al);
             cur = next;
         }
 
-        // Final gap: [gap_start, N)
         if let Some((body, waste)) = self.fit_gap(gap_start, N, size, align) {
             if waste < best_waste {
                 best = Some((gap_start, prev, body));
             }
         }
 
-        let (gap, prev, body) = match best {
+        let (gap, prev, _body) = match best {
             Some(b) => b,
             None => return ptr::null_mut(),
         };
 
-        // Insert into sorted allocated list.
         let next = if prev == NONE {
             let old = self.head();
             self.set_head(gap);
             old
         } else {
-            let [pl, old_next] = self.get(prev);
-            self.set(prev, [pl, gap]);
+            let [ps, pa, old_next] = self.get(prev);
+            self.set(prev, [ps, pa, gap]);
             old_next
         };
 
-        self.set(gap, [body, next]);
+        self.set(gap, [size, align, next]);
 
         align_up(base.add(gap + HEADER) as usize, align) as *mut u8
     }
@@ -142,17 +191,16 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
         let target = ptr as usize;
         let align = layout.align();
 
-        // Walk to find the block whose aligned user pointer matches `ptr`.
         let mut prev = NONE;
         let mut cur = self.head();
         while cur != NONE {
-            let [_, next] = self.get(cur);
+            let [_, _, next] = self.get(cur);
             if align_up(base + cur + HEADER, align) == target {
                 if prev == NONE {
                     self.set_head(next);
                 } else {
-                    let [pl, _] = self.get(prev);
-                    self.set(prev, [pl, next]);
+                    let [ps, pa, _] = self.get(prev);
+                    self.set(prev, [ps, pa, next]);
                 }
                 return;
             }
@@ -220,10 +268,9 @@ mod tests {
             let s2 = a.alloc(big);
             let g2 = a.alloc(sep);
 
-            a.dealloc(s1, small); // ~100-byte gap
-            a.dealloc(s2, big);   // ~400-byte gap
+            a.dealloc(s1, small);
+            a.dealloc(s2, big);
 
-            // 80 bytes should land in the tighter ~100-byte gap.
             let req = lay(80, 8);
             let p = a.alloc(req);
             assert!(!p.is_null());
@@ -271,7 +318,6 @@ mod tests {
             a.dealloc(p1, l);
             a.dealloc(p3, l);
 
-            // All blocks freed → entire buffer is one big gap again.
             let big = lay(4096 - HEADER, 8);
             let p = a.alloc(big);
             assert!(!p.is_null());
@@ -289,6 +335,80 @@ mod tests {
             let p2 = a.alloc(l);
             assert!(!p2.is_null());
             a.dealloc(p2, l);
+        }
+    }
+
+    #[test]
+    fn optimize_space_compacts() {
+        let a = Allocator::<4096>::new();
+        unsafe {
+            let l = lay(64, 8);
+            let p1 = a.alloc(l);
+            let p2 = a.alloc(l);
+            let p3 = a.alloc(l);
+
+            // Free the middle block, creating a gap.
+            a.dealloc(p2, l);
+
+            // p3 should slide left into p2's old space.
+            let mut moved = false;
+            let mut new_p3 = p3;
+            a.optimize_space(|old, new| {
+                if old == p3 {
+                    moved = true;
+                    new_p3 = new;
+                }
+            });
+
+            assert!(moved, "p3 should have been relocated");
+            assert!(
+                (new_p3 as usize) < (p3 as usize),
+                "p3 should have moved to a lower address"
+            );
+
+            // Data should still be accessible at the new location.
+            ptr::write_bytes(new_p3, 0xCD, 64);
+
+            // After compaction, a larger contiguous region should be available.
+            // 2 blocks of (HEADER + 64), so free = 4096 - 2*(HEADER+64) - HEADER for new block.
+            let big = lay(4096 - 3 * HEADER - 128, 8);
+            let p4 = a.alloc(big);
+            assert!(!p4.is_null());
+
+            a.dealloc(p1, l);
+            a.dealloc(new_p3, l);
+            a.dealloc(p4, big);
+        }
+    }
+
+    #[test]
+    fn optimize_space_preserves_data() {
+        let a = Allocator::<4096>::new();
+        unsafe {
+            let l = lay(8, 8);
+            let p1 = a.alloc(l);
+            let p2 = a.alloc(l);
+            let p3 = a.alloc(l);
+
+            ptr::write(p1 as *mut u64, 0xAAAA);
+            ptr::write(p2 as *mut u64, 0xBBBB);
+            ptr::write(p3 as *mut u64, 0xCCCC);
+
+            // Free p1, creating a gap at the front.
+            a.dealloc(p1, l);
+
+            let mut new_p2 = p2;
+            let mut new_p3 = p3;
+            a.optimize_space(|old, new| {
+                if old == p2 { new_p2 = new; }
+                if old == p3 { new_p3 = new; }
+            });
+
+            assert_eq!(ptr::read(new_p2 as *const u64), 0xBBBB);
+            assert_eq!(ptr::read(new_p3 as *const u64), 0xCCCC);
+
+            a.dealloc(new_p2, l);
+            a.dealloc(new_p3, l);
         }
     }
 }
