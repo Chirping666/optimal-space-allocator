@@ -84,6 +84,7 @@ fn body_len(base: usize, off: usize, size: usize, align: usize) -> usize {
 
 #[inline]
 const fn align_up(v: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two(), "align must be a power of two");
     (v + align - 1) & !(align - 1)
 }
 
