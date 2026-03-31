@@ -51,6 +51,7 @@ impl Drop for LockGuard<'_> {
 ///
 /// Thread safety is provided by an internal spin lock that serialises all
 /// operations on the allocator.
+#[repr(C)]
 pub struct Allocator<const N: usize> {
     data: UnsafeCell<[u8; N]>,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].

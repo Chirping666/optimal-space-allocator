@@ -10,3 +10,5 @@
 
 - **Handle `realloc` with `new_size == 0`**: Added early return in `realloc` that treats `new_size == 0` as a dealloc, freeing the block and returning null. This makes the implementation-defined behaviour explicit and documented. All 17 tests pass.
 
+- **Make `Allocator` `#[repr(C)]`**: Added `#[repr(C)]` to the `Allocator` struct so `data` is guaranteed at offset 0. Tests like `free_reclaims_full_space` and `alloc_exactly_fills_buffer` rely on this layout. Without it, the compiler could reorder fields. All 17 tests pass.
+
