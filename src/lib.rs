@@ -10,13 +10,13 @@ const HEADER: usize = size_of::<[usize; 2]>();
 
 /// Best-fit allocator over a fixed `[u8; N]` buffer.
 ///
-/// Free blocks are linked via inline `[length, next]` headers.
-/// Allocation always picks the tightest-fitting free block.
+/// Only *allocated* blocks carry inline `[length, next]` headers, kept sorted
+/// by offset. Free space is implicit: every gap between allocated blocks.
+/// Freeing a block simply unlinks it — no coalescing required.
 pub struct Allocator<const N: usize> {
     data: UnsafeCell<[u8; N]>,
-    /// Byte offset of the first free block's header, or [`NONE`].
-    free: UnsafeCell<usize>,
-    init: UnsafeCell<bool>,
+    /// Offset of the first allocated block (sorted by position), or [`NONE`].
+    head: UnsafeCell<usize>,
 }
 
 // SAFETY: GlobalAlloc contract requires callers to synchronise.
@@ -26,8 +26,7 @@ impl<const N: usize> Allocator<N> {
     pub const fn new() -> Self {
         Self {
             data: UnsafeCell::new([0; N]),
-            free: UnsafeCell::new(NONE),
-            init: UnsafeCell::new(false),
+            head: UnsafeCell::new(NONE), // no allocations → entire buffer is free
         }
     }
 
@@ -36,11 +35,11 @@ impl<const N: usize> Allocator<N> {
     }
 
     unsafe fn head(&self) -> usize {
-        *self.free.get()
+        *self.head.get()
     }
 
     unsafe fn set_head(&self, v: usize) {
-        *self.free.get() = v;
+        *self.head.get() = v;
     }
 
     /// Read the `[length, next]` header at byte offset `off`.
@@ -53,81 +52,24 @@ impl<const N: usize> Allocator<N> {
         ptr::write(self.buf().add(off) as *mut [usize; 2], h);
     }
 
-    unsafe fn ensure_init(&self) {
-        if *self.init.get() {
-            return;
+    /// Try to fit an allocation of `size` bytes at `align` into a gap.
+    /// Returns `(body_len, waste)` on success.
+    unsafe fn fit_gap(
+        &self,
+        gap_start: usize,
+        gap_end: usize,
+        size: usize,
+        align: usize,
+    ) -> Option<(usize, usize)> {
+        let gap = gap_end.checked_sub(gap_start)?;
+        if gap < HEADER {
+            return None;
         }
-        *self.init.get() = true;
-        assert!(N >= HEADER, "buffer too small");
-        self.set(0, [N - HEADER, NONE]);
-        self.set_head(0);
-    }
-
-    /// Point `prev`'s next (or the list head) at `replacement`.
-    unsafe fn relink(&self, prev: usize, replacement: usize) {
-        if prev == NONE {
-            self.set_head(replacement);
-        } else {
-            let [len, _] = self.get(prev);
-            self.set(prev, [len, replacement]);
-        }
-    }
-
-    /// Remove the free block at `off` from the list.
-    unsafe fn remove_free(&self, off: usize) {
-        let mut prev = NONE;
-        let mut cur = self.head();
-        while cur != NONE {
-            let [_, next] = self.get(cur);
-            if cur == off {
-                self.relink(prev, next);
-                return;
-            }
-            prev = cur;
-            cur = next;
-        }
-    }
-
-    /// Return a freed block to the list, coalescing with adjacent neighbours.
-    unsafe fn insert_and_coalesce(&self, off: usize, len: usize) {
-        let end = off + HEADER + len;
-        let (mut before, mut after) = (NONE, NONE);
-
-        let mut cur = self.head();
-        while cur != NONE {
-            let [cl, next] = self.get(cur);
-            if cur + HEADER + cl == off {
-                before = cur;
-            }
-            if end == cur {
-                after = cur;
-            }
-            cur = next;
-        }
-
-        match (before != NONE, after != NONE) {
-            (true, true) => {
-                let [bl, _] = self.get(before);
-                let [al, _] = self.get(after);
-                self.remove_free(after);
-                let [_, bn] = self.get(before);
-                self.set(before, [bl + HEADER + len + HEADER + al, bn]);
-            }
-            (true, false) => {
-                let [bl, bn] = self.get(before);
-                self.set(before, [bl + HEADER + len, bn]);
-            }
-            (false, true) => {
-                let [al, _] = self.get(after);
-                self.remove_free(after);
-                self.set(off, [len + HEADER + al, self.head()]);
-                self.set_head(off);
-            }
-            (false, false) => {
-                self.set(off, [len, self.head()]);
-                self.set_head(off);
-            }
-        }
+        let raw = self.buf().add(gap_start + HEADER) as usize;
+        let padding = align_up(raw, align) - raw;
+        let body = align_up(size + padding, size_of::<usize>());
+        let needed = HEADER + body;
+        (needed <= gap).then(|| (body, gap - needed))
     }
 }
 
@@ -138,69 +80,85 @@ const fn align_up(v: usize, align: usize) -> usize {
 
 unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.ensure_init();
-
         let size = layout.size();
         let align = layout.align();
         let base = self.buf();
 
-        // ---- best-fit scan ----
-        let (mut best, mut best_prev, mut best_waste) = (NONE, NONE, usize::MAX);
+        // Walk the sorted allocated list, evaluating every gap.
+        let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
+        let mut best_waste = usize::MAX;
+
         let mut prev = NONE;
+        let mut gap_start: usize = 0;
         let mut cur = self.head();
 
         while cur != NONE {
-            let [len, next] = self.get(cur);
-            let raw = base.add(cur + HEADER) as usize;
-            let total = align_up(size + (align_up(raw, align) - raw), size_of::<usize>());
-
-            if len >= total {
-                let waste = len - total;
+            if let Some((body, waste)) = self.fit_gap(gap_start, cur, size, align) {
                 if waste < best_waste {
-                    (best, best_prev, best_waste) = (cur, prev, waste);
+                    best = Some((gap_start, prev, body));
+                    best_waste = waste;
                     if waste == 0 {
                         break;
                     }
                 }
             }
 
+            let [len, next] = self.get(cur);
             prev = cur;
+            gap_start = cur + HEADER + len;
             cur = next;
         }
 
-        if best == NONE {
-            return ptr::null_mut();
+        // Final gap: [gap_start, N)
+        if let Some((body, waste)) = self.fit_gap(gap_start, N, size, align) {
+            if waste < best_waste {
+                best = Some((gap_start, prev, body));
+            }
         }
 
-        // ---- carve out the chosen block ----
-        let [len, next] = self.get(best);
-        let raw = base.add(best + HEADER) as usize;
-        let padding = align_up(raw, align) - raw;
-        let total = align_up(size + padding, size_of::<usize>());
-        let remainder = len - total;
-
-        let (body_len, successor) = if remainder >= HEADER + size_of::<usize>() {
-            let split = best + HEADER + total;
-            self.set(split, [remainder - HEADER, next]);
-            (total, split)
-        } else {
-            (len, next) // keep the full block to avoid tiny fragments
+        let (gap, prev, body) = match best {
+            Some(b) => b,
+            None => return ptr::null_mut(),
         };
 
-        self.relink(best_prev, successor);
-        self.set(best, [body_len, 0]);
+        // Insert into sorted allocated list.
+        let next = if prev == NONE {
+            let old = self.head();
+            self.set_head(gap);
+            old
+        } else {
+            let [pl, old_next] = self.get(prev);
+            self.set(prev, [pl, gap]);
+            old_next
+        };
 
-        // Back-pointer for O(1) dealloc (lands in header's `next` slot or padding).
-        let user_ptr = align_up(raw, align) as *mut u8;
-        ptr::write((user_ptr as *mut usize).sub(1), best);
+        self.set(gap, [body, next]);
 
-        user_ptr
+        align_up(base.add(gap + HEADER) as usize, align) as *mut u8
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        let off = ptr::read((ptr as *const usize).sub(1));
-        let [len, _] = self.get(off);
-        self.insert_and_coalesce(off, len);
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let base = self.buf() as usize;
+        let target = ptr as usize;
+        let align = layout.align();
+
+        // Walk to find the block whose aligned user pointer matches `ptr`.
+        let mut prev = NONE;
+        let mut cur = self.head();
+        while cur != NONE {
+            let [_, next] = self.get(cur);
+            if align_up(base + cur + HEADER, align) == target {
+                if prev == NONE {
+                    self.set_head(next);
+                } else {
+                    let [pl, _] = self.get(prev);
+                    self.set(prev, [pl, next]);
+                }
+                return;
+            }
+            prev = cur;
+            cur = next;
+        }
     }
 }
 
@@ -250,27 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn best_fit_prefers_tighter_block() {
+    fn best_fit_prefers_tighter_gap() {
         let a = Allocator::<8192>::new();
         unsafe {
-            // Create holes of different sizes by allocating separators.
             let sep = lay(64, 8);
             let small = lay(100, 8);
             let big = lay(400, 8);
 
-            let s1 = a.alloc(small); // 100-byte block
-            let g1 = a.alloc(sep);   // separator
-            let s2 = a.alloc(big);   // 400-byte block
-            let g2 = a.alloc(sep);   // separator
+            let s1 = a.alloc(small);
+            let g1 = a.alloc(sep);
+            let s2 = a.alloc(big);
+            let g2 = a.alloc(sep);
 
-            a.dealloc(s1, small); // free 100-byte hole
-            a.dealloc(s2, big);   // free 400-byte hole
+            a.dealloc(s1, small); // ~100-byte gap
+            a.dealloc(s2, big);   // ~400-byte gap
 
-            // Ask for 80 bytes — best fit should pick the 100-byte hole.
+            // 80 bytes should land in the tighter ~100-byte gap.
             let req = lay(80, 8);
             let p = a.alloc(req);
             assert!(!p.is_null());
-            // p should land in s1's region (lower address, smaller hole).
             assert!((p as usize) < (g1 as usize));
 
             a.dealloc(p, req);
@@ -287,11 +243,7 @@ mod tests {
                 let l = lay(32, align);
                 let p = a.alloc(l);
                 assert!(!p.is_null());
-                assert_eq!(
-                    p as usize % align,
-                    0,
-                    "pointer not {align}-byte aligned"
-                );
+                assert_eq!(p as usize % align, 0, "pointer not {align}-byte aligned");
                 a.dealloc(p, l);
             }
         }
@@ -307,7 +259,7 @@ mod tests {
     }
 
     #[test]
-    fn coalescing_reclaims_full_space() {
+    fn free_reclaims_full_space() {
         let a = Allocator::<4096>::new();
         unsafe {
             let l = lay(64, 8);
@@ -319,7 +271,7 @@ mod tests {
             a.dealloc(p1, l);
             a.dealloc(p3, l);
 
-            // After full coalescing the entire buffer should be available again.
+            // All blocks freed → entire buffer is one big gap again.
             let big = lay(4096 - HEADER, 8);
             let p = a.alloc(big);
             assert!(!p.is_null());
