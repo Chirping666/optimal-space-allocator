@@ -19,6 +19,30 @@ struct BlockHeader {
 
 const HEADER: usize = size_of::<BlockHeader>();
 
+/// RAII guard that releases the spin lock on drop, ensuring panic safety.
+///
+/// If a panic occurs while the lock is held (e.g. from a `debug_assert!`),
+/// the guard's `Drop` impl will release the lock, preventing permanent
+/// deadlock of all threads.
+struct LockGuard<'a> {
+    lock: &'a AtomicBool,
+}
+
+impl<'a> LockGuard<'a> {
+    fn acquire(lock: &'a AtomicBool) -> Self {
+        while lock.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        Self { lock }
+    }
+}
+
+impl Drop for LockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.store(false, Ordering::Release);
+    }
+}
+
 /// Best-fit allocator over a fixed `[u8; N]` buffer.
 ///
 /// Only *allocated* blocks carry inline [`BlockHeader`]s, kept sorted by
@@ -72,14 +96,8 @@ impl<const N: usize> Allocator<N> {
         }
     }
 
-    fn acquire(&self) {
-        while self.lock.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn release(&self) {
-        self.lock.store(false, Ordering::Release);
+    fn lock(&self) -> LockGuard<'_> {
+        LockGuard::acquire(&self.lock)
     }
 
     unsafe fn buf(&self) -> *mut u8 {
@@ -146,7 +164,7 @@ impl<const N: usize> Allocator<N> {
     /// The caller must update **all** live pointers via the `relocate`
     /// callback. Any pointer not updated becomes dangling.
     pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
-        self.acquire();
+        let _guard = self.lock();
         // SAFETY: spin lock held — exclusive access to data and head
         let base = unsafe { self.buf() };
         let base_addr = base as usize;
@@ -202,13 +220,12 @@ impl<const N: usize> Allocator<N> {
             target = (if target < cur { target } else { cur }) + HEADER + new_body;
             cur = hdr.next;
         }
-        self.release();
     }
 }
 
 unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.acquire();
+        let _guard = self.lock();
         let size = layout.size();
         let align = layout.align();
         // SAFETY: spin lock held — exclusive access to data and head
@@ -251,7 +268,6 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
         let (gap, prev, _body) = match best {
             Some(b) => b,
             None => {
-                self.release();
                 return ptr::null_mut();
             }
         };
@@ -276,64 +292,63 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
         unsafe { self.set(gap, BlockHeader { size, align, next }) };
 
         // SAFETY: gap + HEADER is within the buffer
-        let result = align_up(unsafe { base.add(gap + HEADER) } as usize, align) as *mut u8;
-        self.release();
-        result
+        align_up(unsafe { base.add(gap + HEADER) } as usize, align) as *mut u8
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        self.acquire();
-        // SAFETY: spin lock held — exclusive access to data and head
-        let base = unsafe { self.buf() };
-        let base_addr = base as usize;
-        let target = ptr as usize;
+        {
+            let _guard = self.lock();
+            // SAFETY: spin lock held — exclusive access to data and head
+            let base = unsafe { self.buf() };
+            let base_addr = base as usize;
+            let target = ptr as usize;
 
-        // Walk the list to find the block matching `ptr`.
-        let mut cur = unsafe { self.head() };
-        while cur != NONE {
-            // SAFETY: cur is a valid block offset
-            let hdr = unsafe { self.get(cur) };
-            if align_up(base_addr + cur + HEADER, hdr.align) == target {
-                // Found the block. Determine the gap end (next block or buffer end).
-                let gap_end = if hdr.next == NONE { N } else { hdr.next };
-                let new_body = body_len(base_addr, cur, new_size, hdr.align);
-                let needed = HEADER + new_body;
+            // Walk the list to find the block matching `ptr`.
+            let mut cur = unsafe { self.head() };
+            while cur != NONE {
+                // SAFETY: cur is a valid block offset
+                let hdr = unsafe { self.get(cur) };
+                if align_up(base_addr + cur + HEADER, hdr.align) == target {
+                    // Found the block. Determine the gap end (next block or buffer end).
+                    let gap_end = if hdr.next == NONE { N } else { hdr.next };
+                    let new_body = body_len(base_addr, cur, new_size, hdr.align);
+                    let needed = HEADER + new_body;
 
-                if cur + needed <= gap_end {
-                    // In-place expansion: just update the stored size.
-                    // SAFETY: cur is a valid block offset
-                    unsafe {
-                        self.set(cur, BlockHeader { size: new_size, ..hdr });
+                    if cur + needed <= gap_end {
+                        // In-place expansion: just update the stored size.
+                        // SAFETY: cur is a valid block offset
+                        unsafe {
+                            self.set(cur, BlockHeader { size: new_size, ..hdr });
+                        }
+                        return ptr;
                     }
-                    self.release();
-                    return ptr;
-                }
 
-                // Cannot expand in-place — fall back to alloc + copy + dealloc.
-                self.release();
-                let new_layout = unsafe {
-                    // SAFETY: align is a valid power of two from the original allocation
-                    Layout::from_size_align_unchecked(new_size, layout.align())
-                };
-                let new_ptr = unsafe { self.alloc(new_layout) };
-                if !new_ptr.is_null() {
-                    let copy_size = if layout.size() < new_size { layout.size() } else { new_size };
-                    // SAFETY: both pointers are valid for their respective sizes
-                    unsafe { ptr::copy_nonoverlapping(ptr, new_ptr, copy_size) };
-                    // SAFETY: ptr was allocated with layout
-                    unsafe { self.dealloc(ptr, layout) };
+                    // Cannot expand in-place — drop guard before re-acquiring
+                    // in alloc/dealloc to avoid deadlock.
+                    drop(_guard);
+                    let new_layout = unsafe {
+                        // SAFETY: align is a valid power of two from the original allocation
+                        Layout::from_size_align_unchecked(new_size, layout.align())
+                    };
+                    let new_ptr = unsafe { self.alloc(new_layout) };
+                    if !new_ptr.is_null() {
+                        let copy_size = if layout.size() < new_size { layout.size() } else { new_size };
+                        // SAFETY: both pointers are valid for their respective sizes
+                        unsafe { ptr::copy_nonoverlapping(ptr, new_ptr, copy_size) };
+                        // SAFETY: ptr was allocated with layout
+                        unsafe { self.dealloc(ptr, layout) };
+                    }
+                    return new_ptr;
                 }
-                return new_ptr;
+                cur = hdr.next;
             }
-            cur = hdr.next;
         }
 
-        self.release();
         ptr::null_mut()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        self.acquire();
+        let _guard = self.lock();
         // SAFETY: spin lock held — exclusive access to data and head
         let base = unsafe { self.buf() } as usize;
         let target = ptr as usize;
@@ -356,13 +371,11 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
                         self.set(prev, BlockHeader { next: hdr.next, ..prev_hdr });
                     }
                 }
-                self.release();
                 return;
             }
             prev = cur;
             cur = hdr.next;
         }
-        self.release();
         debug_assert!(false, "dealloc: pointer {target:#x} not found in allocated list");
     }
 }

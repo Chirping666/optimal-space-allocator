@@ -2,7 +2,7 @@
 
 ## Critical Issues
 
-- [ ] **Make spin lock panic-safe**: Replace manual `acquire()`/`release()` with a RAII `LockGuard` that releases in `Drop`, so a panic between acquire and release (e.g. from `debug_assert!` in `dealloc`) does not permanently deadlock all threads
+- [x] **Make spin lock panic-safe**: Replace manual `acquire()`/`release()` with a RAII `LockGuard` that releases in `Drop`, so a panic between acquire and release (e.g. from `debug_assert!` in `dealloc`) does not permanently deadlock all threads
 
 ## Design Issues
 
