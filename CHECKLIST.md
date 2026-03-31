@@ -13,5 +13,5 @@
 
 ## Testing
 
-- [ ] **Add panic-safety test for lock**: Verify that after a panicking `dealloc` (invalid pointer in debug mode), subsequent operations on the allocator do not deadlock
-- [ ] **Add `realloc` edge-case tests**: realloc to zero size, realloc of an invalid pointer, realloc that exactly fills the remaining gap
+- [x] **Add panic-safety test for lock**: Verify that after a panicking `dealloc` (invalid pointer in debug mode), subsequent operations on the allocator do not deadlock
+- [x] **Add `realloc` edge-case tests**: realloc to zero size, realloc of an invalid pointer, realloc that exactly fills the remaining gap

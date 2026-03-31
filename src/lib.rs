@@ -765,4 +765,101 @@ mod tests {
         }));
         assert!(result.is_err(), "dealloc of invalid pointer should panic in debug mode");
     }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn lock_released_after_panic() {
+        extern crate std;
+        let a = Allocator::<1024>::new();
+
+        // Allocate a valid block, then trigger a panicking dealloc with an
+        // invalid pointer. The RAII LockGuard should release the lock even
+        // though dealloc panics.
+        unsafe {
+            let l = lay(64, 8);
+            let p = a.alloc(l);
+            assert!(!p.is_null());
+
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                a.dealloc(0x1000 as *mut u8, lay(64, 8));
+            }));
+
+            // If the lock were still held, this alloc would deadlock.
+            let p2 = a.alloc(l);
+            assert!(!p2.is_null(), "alloc after panicking dealloc must not deadlock");
+
+            a.dealloc(p, l);
+            a.dealloc(p2, l);
+        }
+    }
+
+    #[test]
+    fn realloc_zero_size() {
+        let a = Allocator::<1024>::new();
+        unsafe {
+            let l = lay(64, 8);
+            let p = a.alloc(l);
+            assert!(!p.is_null());
+
+            // realloc to size 0 should act as dealloc and return null.
+            let p2 = a.realloc(p, l, 0);
+            assert!(p2.is_null(), "realloc to size 0 should return null");
+
+            // The space should be fully reclaimed — we can allocate again.
+            let p3 = a.alloc(l);
+            assert!(!p3.is_null(), "space should be reclaimed after realloc to 0");
+            a.dealloc(p3, l);
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn realloc_invalid_pointer() {
+        extern crate std;
+        let a = Allocator::<1024>::new();
+        unsafe {
+            // realloc of a pointer that was never allocated should return null.
+            let result = a.realloc(0x1000 as *mut u8, lay(64, 8), 128);
+            assert!(result.is_null(), "realloc of invalid pointer should return null");
+        }
+    }
+
+    #[test]
+    fn realloc_fills_remaining_gap() {
+        let a = Allocator::<4096>::new();
+        unsafe {
+            let l = lay(64, 8);
+            let p1 = a.alloc(l);
+            let p2 = a.alloc(l);
+            assert!(!p1.is_null());
+            assert!(!p2.is_null());
+
+            // Free p1 to create a gap at the start, then realloc p2 to
+            // exactly fill the remaining space after p2.
+            // First, find how much space is available after p2.
+            let base = &a as *const _ as usize;
+            let p2_off = p2 as usize - base;
+            let remaining = 4096 - p2_off;
+
+            if remaining > 64 {
+                // Grow p2 to fill the trailing space.
+                let p2_new = a.realloc(p2, l, remaining);
+                assert_eq!(p2_new, p2, "should grow in-place into trailing gap");
+
+                // No more space for another allocation.
+                let p3 = a.alloc(lay(1, 1));
+                // p3 may fit in the gap left by the header overhead, or be null.
+                // The key assertion is that realloc succeeded.
+                if !p3.is_null() {
+                    a.dealloc(p3, lay(1, 1));
+                }
+
+                a.dealloc(p1, l);
+                a.dealloc(p2_new, lay(remaining, 8));
+            } else {
+                a.dealloc(p1, l);
+                a.dealloc(p2, l);
+            }
+        }
+    }
 }

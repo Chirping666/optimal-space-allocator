@@ -12,3 +12,7 @@
 
 - **Make `Allocator` `#[repr(C)]`**: Added `#[repr(C)]` to the `Allocator` struct so `data` is guaranteed at offset 0. Tests like `free_reclaims_full_space` and `alloc_exactly_fills_buffer` rely on this layout. Without it, the compiler could reorder fields. All 17 tests pass.
 
+- **Add panic-safety test for lock**: Added `lock_released_after_panic` test that triggers a panicking `dealloc` (invalid pointer) inside `catch_unwind`, then verifies a subsequent `alloc` succeeds without deadlocking. Confirms the RAII `LockGuard` releases the lock on unwind. All 21 tests pass.
+
+- **Add `realloc` edge-case tests**: Added 3 tests — `realloc_zero_size` (verifies dealloc semantics and space reclamation), `realloc_invalid_pointer` (returns null for unrecognised pointer), `realloc_fills_remaining_gap` (in-place grow to fill all trailing space). All 21 tests pass.
+
