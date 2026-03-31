@@ -302,6 +302,14 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // new_size == 0 is implementation-defined per GlobalAlloc docs.
+        // We treat it as dealloc and return null.
+        if new_size == 0 {
+            // SAFETY: ptr was allocated with layout
+            unsafe { self.dealloc(ptr, layout) };
+            return ptr::null_mut();
+        }
+
         {
             let _guard = self.lock();
             // SAFETY: spin lock held — exclusive access to data and head

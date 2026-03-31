@@ -8,3 +8,5 @@
 
 - **Add `Send` safety comment**: Added an explicit comment next to the `Sync` impl explaining why `Send` is also safe: all fields are `Send`, no thread-local state is referenced, and the spin lock ensures sound access from any thread.
 
+- **Handle `realloc` with `new_size == 0`**: Added early return in `realloc` that treats `new_size == 0` as a dealloc, freeing the block and returning null. This makes the implementation-defined behaviour explicit and documented. All 17 tests pass.
+
