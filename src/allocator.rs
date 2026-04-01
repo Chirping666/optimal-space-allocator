@@ -6,7 +6,7 @@ use core::sync::atomic::AtomicBool;
 use crate::block::{align_up, body_len, BlockHeader, HEADER, NONE};
 use crate::lock::LockGuard;
 
-/// Best-fit allocator over a fixed `[u8; N]` buffer.
+/// Best-fit allocator over a caller-provided byte buffer.
 ///
 /// Only *allocated* blocks carry inline [`BlockHeader`]s, kept sorted by
 /// offset. Free space is implicit: every gap between allocated blocks.
@@ -15,27 +15,37 @@ use crate::lock::LockGuard;
 /// Thread safety is provided by an internal spin lock that serialises all
 /// operations on the allocator.
 #[repr(C)]
-pub struct Allocator<const N: usize> {
-    data: UnsafeCell<[u8; N]>,
+pub struct Allocator {
+    data: *mut [u8],
+    length: usize,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].
     head: UnsafeCell<usize>,
-    /// Spin lock protecting `data` and `head`.
+    /// Spin lock protecting the buffer and `head`.
     lock: AtomicBool,
 }
 
-// SAFETY: All mutable access to `data` and `head` is guarded by the `lock`
-// spin lock, ensuring mutual exclusion across threads.
-unsafe impl<const N: usize> Sync for Allocator<N> {}
+// SAFETY: All mutable access to the buffer and head is guarded by the `lock`
+// spin lock, ensuring mutual exclusion across threads. The raw pointer `data`
+// is only dereferenced under the lock.
+unsafe impl Sync for Allocator {}
+unsafe impl Send for Allocator {}
 
-// SAFETY: `Send` is auto-derived because all fields (`UnsafeCell<[u8; N]>`,
-// `UnsafeCell<usize>`, `AtomicBool`) are `Send`. Transferring an `Allocator`
-// to another thread is safe: no thread-local state is referenced, and the spin
-// lock ensures sound access from whichever thread owns or shares the value.
-
-impl<const N: usize> Allocator<N> {
-    pub const fn new() -> Self {
+impl Allocator {
+    pub fn new(data: &mut [u8]) -> Self {
+        let length = data.len();
+        let data: *mut [u8] = data;
         Self {
-            data: UnsafeCell::new([0; N]),
+            data,
+            length,
+            head: UnsafeCell::new(NONE),
+            lock: AtomicBool::new(false),
+        }
+    }
+
+    pub fn from_ptr(data: *mut [u8], length: usize) -> Self {
+        Self {
+            data,
+            length,
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
         }
@@ -45,9 +55,8 @@ impl<const N: usize> Allocator<N> {
         LockGuard::acquire(&self.lock)
     }
 
-    unsafe fn buf(&self) -> *mut u8 {
-        // SAFETY: caller ensures exclusive access to the buffer
-        unsafe { (*self.data.get()).as_mut_ptr() }
+    fn buf(&self) -> *mut u8 {
+        self.data as *mut u8
     }
 
     unsafe fn head(&self) -> usize {
@@ -78,7 +87,7 @@ impl<const N: usize> Allocator<N> {
 
     /// Try to fit `size` bytes at `align` into the gap `[gap_start, gap_end)`.
     /// Returns `(body_len, waste)` on success.
-    unsafe fn fit_gap(
+    fn fit_gap(
         &self,
         gap_start: usize,
         gap_end: usize,
@@ -89,8 +98,7 @@ impl<const N: usize> Allocator<N> {
         if gap < HEADER {
             return None;
         }
-        // SAFETY: caller ensures the allocator is exclusively accessed
-        let body = body_len(unsafe { self.buf() } as usize, gap_start, size, align);
+        let body = body_len(self.buf() as usize, gap_start, size, align);
         let needed = HEADER + body;
         debug_assert!(
             gap_start + needed <= gap_end || needed > gap,
@@ -110,10 +118,9 @@ impl<const N: usize> Allocator<N> {
     /// callback. Any pointer not updated becomes dangling.
     pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
         let _guard = self.lock();
-        // SAFETY: spin lock held — exclusive access to data and head
-        let base = unsafe { self.buf() };
+        let base = self.buf();
         let base_addr = base as usize;
-        let mut target: usize = 0; // next available offset
+        let mut target: usize = 0;
         let mut prev = NONE;
         // SAFETY: spin lock held — exclusive access
         let mut cur = unsafe { self.head() };
@@ -168,13 +175,13 @@ impl<const N: usize> Allocator<N> {
     }
 }
 
-unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
+unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _guard = self.lock();
         let size = layout.size();
         let align = layout.align();
-        // SAFETY: spin lock held — exclusive access to data and head
-        let base = unsafe { self.buf() };
+        let base = self.buf();
+        let len = self.length;
 
         let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
         let mut best_waste = usize::MAX;
@@ -185,8 +192,7 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
         let mut cur = unsafe { self.head() };
 
         while cur != NONE {
-            // SAFETY: spin lock held — exclusive access
-            if let Some((body, waste)) = unsafe { self.fit_gap(gap_start, cur, size, align) } {
+            if let Some((body, waste)) = self.fit_gap(gap_start, cur, size, align) {
                 if waste < best_waste {
                     best = Some((gap_start, prev, body));
                     best_waste = waste;
@@ -203,8 +209,7 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
             cur = hdr.next;
         }
 
-        // SAFETY: spin lock held — exclusive access
-        if let Some((body, waste)) = unsafe { self.fit_gap(gap_start, N, size, align) } {
+        if let Some((body, waste)) = self.fit_gap(gap_start, len, size, align) {
             if waste < best_waste {
                 best = Some((gap_start, prev, body));
             }
@@ -251,9 +256,9 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
 
         {
             let _guard = self.lock();
-            // SAFETY: spin lock held — exclusive access to data and head
-            let base = unsafe { self.buf() };
+            let base = self.buf();
             let base_addr = base as usize;
+            let len = self.length;
             let target = ptr as usize;
 
             // Walk the list to find the block matching `ptr`.
@@ -263,7 +268,7 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
                 let hdr = unsafe { self.get(cur) };
                 if align_up(base_addr + cur + HEADER, hdr.align) == target {
                     // Found the block. Determine the gap end (next block or buffer end).
-                    let gap_end = if hdr.next == NONE { N } else { hdr.next };
+                    let gap_end = if hdr.next == NONE { len } else { hdr.next };
                     let new_body = body_len(base_addr, cur, new_size, hdr.align);
                     let needed = HEADER + new_body;
 
@@ -302,8 +307,7 @@ unsafe impl<const N: usize> GlobalAlloc for Allocator<N> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         let _guard = self.lock();
-        // SAFETY: spin lock held — exclusive access to data and head
-        let base = unsafe { self.buf() } as usize;
+        let base = self.buf() as usize;
         let target = ptr as usize;
 
         let mut prev = NONE;

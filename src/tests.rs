@@ -10,7 +10,8 @@ fn lay(size: usize, align: usize) -> Layout {
 
 #[test]
 fn basic_alloc_dealloc() {
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let p = a.alloc(lay(64, 8));
         assert!(!p.is_null());
@@ -21,7 +22,8 @@ fn basic_alloc_dealloc() {
 
 #[test]
 fn multiple_allocs_are_disjoint() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(128, 8);
         let p1 = a.alloc(l);
@@ -46,7 +48,8 @@ fn multiple_allocs_are_disjoint() {
 
 #[test]
 fn best_fit_prefers_tighter_gap() {
-    let a = Allocator::<8192>::new();
+    let mut buf = [0u8; 8192];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let sep = lay(64, 8);
         let small = lay(100, 8);
@@ -73,7 +76,8 @@ fn best_fit_prefers_tighter_gap() {
 
 #[test]
 fn alignment_is_honoured() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         for &align in &[1, 2, 4, 8, 16, 32, 64, 128, 256] {
             let l = lay(32, align);
@@ -87,7 +91,8 @@ fn alignment_is_honoured() {
 
 #[test]
 fn oom_returns_null() {
-    let a = Allocator::<128>::new();
+    let mut buf = [0u8; 128];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let p = a.alloc(lay(256, 8));
         assert!(p.is_null());
@@ -97,7 +102,9 @@ fn oom_returns_null() {
 #[test]
 fn free_reclaims_full_space() {
     const BUF: usize = 4096;
-    let a = Allocator::<BUF>::new();
+    let mut buf = [0u8; BUF];
+    let base = buf.as_ptr() as usize;
+    let a = Allocator::new(&mut buf);
     unsafe {
         let align = size_of::<usize>();
         let l = lay(64, align);
@@ -111,7 +118,6 @@ fn free_reclaims_full_space() {
 
         // Compute the max allocatable size dynamically: the body region
         // after one HEADER, accounting for alignment padding.
-        let base = &a as *const _ as usize;
         let raw = base + HEADER;
         let padding = align_up(raw, align) - raw;
         let max_body = BUF - HEADER - padding;
@@ -127,7 +133,8 @@ fn free_reclaims_full_space() {
 
 #[test]
 fn reuse_after_free() {
-    let a = Allocator::<512>::new();
+    let mut buf = [0u8; 512];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p1 = a.alloc(l);
@@ -140,7 +147,8 @@ fn reuse_after_free() {
 
 #[test]
 fn optimize_space_compacts() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p1 = a.alloc(l);
@@ -183,7 +191,8 @@ fn optimize_space_compacts() {
 
 #[test]
 fn optimize_space_preserves_data() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(8, 8);
         let p1 = a.alloc(l);
@@ -214,7 +223,8 @@ fn optimize_space_preserves_data() {
 
 #[test]
 fn realloc_in_place_when_space_available() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p = a.alloc(l);
@@ -233,7 +243,8 @@ fn realloc_in_place_when_space_available() {
 
 #[test]
 fn realloc_falls_back_to_copy() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p1 = a.alloc(l);
@@ -255,7 +266,8 @@ fn realloc_falls_back_to_copy() {
 
 #[test]
 fn realloc_shrink() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(128, 8);
         let p = a.alloc(l);
@@ -273,40 +285,36 @@ fn realloc_shrink() {
 fn concurrent_alloc_dealloc() {
     extern crate std;
     use std::sync::Arc;
-    use std::thread;
-    use std::vec::Vec;
 
-    // Large enough for many small concurrent allocations.
-    static ALLOC: Allocator<65536> = Allocator::new();
+    let mut buf = [0u8; 65536];
+    let a = Allocator::new(&mut buf);
 
     let barrier = Arc::new(std::sync::Barrier::new(4));
-    let handles: Vec<_> = (0..4)
-        .map(|_| {
+    std::thread::scope(|s| {
+        for _ in 0..4 {
             let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
+            let a = &a;
+            s.spawn(move || {
                 barrier.wait();
                 for _ in 0..100 {
                     unsafe {
                         let l = lay(32, 8);
-                        let p = ALLOC.alloc(l);
+                        let p = a.alloc(l);
                         if !p.is_null() {
                             ptr::write_bytes(p, 0xAA, 32);
-                            ALLOC.dealloc(p, l);
+                            a.dealloc(p, l);
                         }
                     }
                 }
-            })
-        })
-        .collect();
-
-    for h in handles {
-        h.join().expect("thread panicked");
-    }
+            });
+        }
+    });
 }
 
 #[test]
 fn zero_size_alloc() {
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(0, 1);
         let p = a.alloc(l);
@@ -320,7 +328,8 @@ fn zero_size_alloc() {
 
 #[test]
 fn align_greater_than_size() {
-    let a = Allocator::<4096>::new();
+    let mut buf = [0u8; 4096];
+    let a = Allocator::new(&mut buf);
     unsafe {
         // Align 256 but only 8 bytes of data.
         let l = lay(8, 256);
@@ -336,10 +345,11 @@ fn align_greater_than_size() {
 fn alloc_exactly_fills_buffer() {
     // A tiny buffer that can hold exactly one block.
     const BUF: usize = HEADER + size_of::<usize>();
-    let a = Allocator::<BUF>::new();
+    let mut buf = [0u8; BUF];
+    let base = buf.as_ptr() as usize;
+    let a = Allocator::new(&mut buf);
     unsafe {
         let align = size_of::<usize>();
-        let base = &a as *const _ as usize;
         let raw = base + HEADER;
         let padding = align_up(raw, align) - raw;
         // The exact size that fills the buffer.
@@ -362,7 +372,8 @@ fn alloc_exactly_fills_buffer() {
 #[cfg(debug_assertions)]
 fn dealloc_invalid_pointer_panics() {
     extern crate std;
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         // Attempt to free a pointer that was never allocated.
         a.dealloc(0x1000 as *mut u8, lay(64, 8));
@@ -374,7 +385,8 @@ fn dealloc_invalid_pointer_panics() {
 #[cfg(debug_assertions)]
 fn lock_released_after_panic() {
     extern crate std;
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
 
     // Allocate a valid block, then trigger a panicking dealloc with an
     // invalid pointer. The RAII LockGuard should release the lock even
@@ -399,7 +411,8 @@ fn lock_released_after_panic() {
 
 #[test]
 fn realloc_zero_size() {
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p = a.alloc(l);
@@ -420,7 +433,8 @@ fn realloc_zero_size() {
 #[cfg(debug_assertions)]
 fn realloc_invalid_pointer() {
     extern crate std;
-    let a = Allocator::<1024>::new();
+    let mut buf = [0u8; 1024];
+    let a = Allocator::new(&mut buf);
     unsafe {
         // realloc of a pointer that was never allocated should return null.
         let result = a.realloc(0x1000 as *mut u8, lay(64, 8), 128);
@@ -430,7 +444,10 @@ fn realloc_invalid_pointer() {
 
 #[test]
 fn realloc_fills_remaining_gap() {
-    let a = Allocator::<4096>::new();
+    const BUF: usize = 4096;
+    let mut buf = [0u8; BUF];
+    let base = buf.as_ptr() as usize;
+    let a = Allocator::new(&mut buf);
     unsafe {
         let l = lay(64, 8);
         let p1 = a.alloc(l);
@@ -441,9 +458,8 @@ fn realloc_fills_remaining_gap() {
         // Free p1 to create a gap at the start, then realloc p2 to
         // exactly fill the remaining space after p2.
         // First, find how much space is available after p2.
-        let base = &a as *const _ as usize;
         let p2_off = p2 as usize - base;
-        let remaining = 4096 - p2_off;
+        let remaining = BUF - p2_off;
 
         if remaining > 64 {
             // Grow p2 to fill the trailing space.
@@ -464,5 +480,20 @@ fn realloc_fills_remaining_gap() {
             a.dealloc(p1, l);
             a.dealloc(p2, l);
         }
+    }
+}
+
+#[test]
+fn from_ptr_constructor() {
+    let mut data = [0u8; 1024];
+    let length = data.len();
+    let ptr: *mut [u8] = &mut data;
+    let a = Allocator::from_ptr(ptr, length);
+    unsafe {
+        let l = lay(64, 8);
+        let p = a.alloc(l);
+        assert!(!p.is_null());
+        ptr::write_bytes(p, 0xAB, 64);
+        a.dealloc(p, l);
     }
 }
