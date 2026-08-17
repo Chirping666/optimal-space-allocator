@@ -13,7 +13,7 @@ ordered Critical > Design > Testing.
   into freed memory). Give `Allocator` a `'buf` lifetime parameter tied to the
   buffer.
 
-- [ ] **`from_ptr` is a safe function over a raw pointer.** It accepts an
+- [x] **`from_ptr` is a safe function over a raw pointer.** It accepts an
   arbitrary `*mut [u8]` plus an independent `length`, so safe code can hand it
   a null/dangling pointer or a length that exceeds the pointed-to region. Make
   it `unsafe` with a documented contract, and take the length from the slice

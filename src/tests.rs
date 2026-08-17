@@ -486,9 +486,10 @@ fn realloc_fills_remaining_gap() {
 #[test]
 fn from_ptr_constructor() {
     let mut data = [0u8; 1024];
-    let length = data.len();
-    let ptr: *mut [u8] = &mut data;
-    let a = Allocator::from_ptr(ptr, length);
+    let raw: *mut [u8] = &mut data;
+    // SAFETY: `raw` points at `data`, which outlives the allocator and is not
+    // touched through any other path until the allocator is dropped.
+    let a = unsafe { Allocator::from_ptr(raw) };
     unsafe {
         let l = lay(64, 8);
         let p = a.alloc(l);

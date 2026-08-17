@@ -63,10 +63,22 @@ impl<'buf> Allocator<'buf> {
         }
     }
 
-    pub fn from_ptr(data: *mut [u8], length: usize) -> Self {
+    /// Build an allocator over a raw buffer, for callers that cannot produce
+    /// a `&mut [u8]`. Prefer [`Allocator::new`] where one is available.
+    ///
+    /// The usable length is taken from `data`'s own slice metadata, so it can
+    /// never disagree with the region actually pointed to.
+    ///
+    /// # Safety
+    ///
+    /// - `data` must point to `data.len()` bytes of writable memory that stays
+    ///   valid for all of `'buf`.
+    /// - Nothing else may read or write that memory while the allocator lives;
+    ///   the allocator assumes exclusive access to it.
+    pub unsafe fn from_ptr(data: *mut [u8]) -> Self {
         Self {
             data,
-            length,
+            length: data.len(),
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
             buffer: PhantomData,
