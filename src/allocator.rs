@@ -226,6 +226,13 @@ unsafe impl GlobalAlloc for Allocator<'_> {
         let base = self.buf();
         let len = self.length;
 
+        // A block costs a header plus padding on top of `size`, so anything
+        // larger than the whole buffer is hopeless. Rejecting it here also
+        // keeps `size + padding` in `body_len` well clear of wrapping.
+        if size > len {
+            return ptr::null_mut();
+        }
+
         let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
         let mut best_waste = usize::MAX;
 
@@ -294,6 +301,14 @@ unsafe impl GlobalAlloc for Allocator<'_> {
         if new_size == 0 {
             // SAFETY: ptr was allocated with layout
             unsafe { self.dealloc(ptr, layout) };
+            return ptr::null_mut();
+        }
+
+        // `new_size` is an arbitrary `usize` here, unlike a `Layout`'s size.
+        // A request larger than the buffer can never be satisfied, and letting
+        // it reach `body_len` risks wrapping into a small block. The original
+        // allocation stays untouched, as a failed realloc must leave it.
+        if new_size > self.length {
             return ptr::null_mut();
         }
 

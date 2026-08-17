@@ -36,7 +36,7 @@ ordered Critical > Design > Testing.
   desynchronising the running `target` cursor from the block's real position.
   Skip the move when it would not actually shrink the block's extent.
 
-- [ ] **Unchecked arithmetic on the request path can wrap.** `body_len` adds
+- [x] **Unchecked arithmetic on the request path can wrap.** `body_len` adds
   `size + padding` and `align_up` adds `align - 1` with no overflow check, and
   `fit_gap` then computes `HEADER + body`. `realloc`'s `new_size` is an
   arbitrary `usize` from the caller, so a wrapped `needed` can compare as
