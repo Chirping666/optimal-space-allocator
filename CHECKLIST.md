@@ -57,13 +57,14 @@ ordered Critical > Design > Testing.
   CLAUDE.md's "named types over tuples" rule exists to prevent. Introduce a
   named struct.
 
-- [ ] **`optimize_space`'s re-entrancy hazard is undocumented.** The `relocate`
+- [x] **`optimize_space`'s re-entrancy hazard is undocumented.** The `relocate`
   callback runs with the spin lock held, so calling any allocator method from
   it deadlocks. Say so in the safety docs.
 
-- [ ] **Simplify the `target` cursor update.** `target = (if target < cur {
+- [x] **Simplify the `target` cursor update.** `target = (if target < cur {
   target } else { cur }) + HEADER + new_body` re-derives the block's position
-  after the fact instead of naming it.
+  after the fact instead of naming it. Resolved by the compaction fix, which
+  had to name both candidate extents to decide between them.
 
 - [x] **Clear the two `clippy::collapsible_if` warnings in `alloc`.** Both
   became let-chains as part of the `Placement` rewrite.

@@ -161,14 +161,20 @@ impl<'buf> Allocator<'buf> {
         (needed <= gap).then(|| gap - needed)
     }
 
-    /// Compact all allocated blocks toward the start of the buffer,
-    /// eliminating fragmentation. Calls `relocate(old_ptr, new_ptr)` for
-    /// every block whose user pointer changed.
+    /// Compact allocated blocks toward the start of the buffer, reclaiming the
+    /// gaps between them.
+    ///
+    /// `relocate(old_ptr, new_ptr)` reports every block that moves. A block
+    /// whose alignment padding absorbs the shift is reported with
+    /// `old_ptr == new_ptr`; a block that cannot move left without growing
+    /// stays put and is not reported at all.
     ///
     /// # Safety
     ///
-    /// The caller must update **all** live pointers via the `relocate`
-    /// callback. Any pointer not updated becomes dangling.
+    /// - The caller must update **all** live pointers via the `relocate`
+    ///   callback. Any pointer left un-updated becomes dangling.
+    /// - `relocate` runs with the allocator's lock held, so it must not call
+    ///   back into the allocator. Doing so deadlocks.
     pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
         let _guard = self.lock();
         let base_addr = self.buf() as usize;
