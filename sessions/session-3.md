@@ -82,6 +82,44 @@ being written down, rather than reasoned about on paper.
   padding. 26 tests pass in debug, 23 in release (three are
   `debug_assertions`-only), and clippy is clean.
 
+## Review round
+
+A code review of the session's diff surfaced four findings; all four were
+fixed.
+
+- **Close the align-driven wrap in the fit path**: The `size > len` guard
+  bounded only the size — `align_up`'s `v + align - 1` still wraps for a
+  buffer within `align` of the top of the address space, and the wrapped
+  result masquerades as a tiny body that compares as fitting (simulated: a
+  request with align `0x4000` near the address-space top yields a 0x38-byte
+  body in release semantics). No guard on size or align alone can close this,
+  because the wrap depends on the buffer's address. Added `checked_body_len`,
+  which reports wrap as "does not fit", behind every unvetted-input path:
+  `waste_in_gap` (alloc), `realloc`'s in-place check (now itself a
+  `waste_in_gap` call), and `optimize_space`'s candidate extent. Plain
+  `body_len` remains for re-measuring vetted blocks, where the sums are
+  monotonic in the offset and provably cannot wrap. Regression-tested as pure
+  arithmetic, since no portable test can allocate at the top of the address
+  space.
+
+- **Reframe the compaction skip as defensive**: Brute-force simulation showed
+  `end_if_moved <= end_if_kept` always holds for vetted blocks at 8-multiple
+  offsets — moving left never widens an extent, only its leading padding
+  grows — so the skip branch is unreachable under current invariants, and the
+  earlier claim that the mixed-alignment test covers it was wrong. The guard
+  stays (it now also absorbs the wrap case above, and skipping a move is
+  always sound) with a comment stating the proof and the defensive intent.
+
+- **Drop an impossible doc claim**: The struct doc suggested installing the
+  allocator as a `#[global_allocator]` via `Allocator<'static>` over a static
+  buffer, which cannot compile — such statics need const initialization, and
+  no const constructor can exist because construction does pointer-to-integer
+  arithmetic to align the base.
+
+- **Pin the lifetime doctest to E0597**: An unannotated `compile_fail` passes
+  on any compile error, so a rename or typo could leave the borrow-check
+  guarantee untested while the doctest stayed green.
+
 ## Notes for next session
 
 - `cargo miri test` is still unavailable on this toolchain (stable only), so
