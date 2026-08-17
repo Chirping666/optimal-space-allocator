@@ -27,9 +27,7 @@ struct Placement {
 /// operations on the allocator.
 ///
 /// The `'buf` parameter ties the allocator to the buffer it was built from,
-/// so it can never outlive that buffer. Installing one as a
-/// `#[global_allocator]` therefore requires an `Allocator<'static>`, backed by
-/// a `static` buffer.
+/// so it can never outlive that buffer.
 #[repr(C)]
 pub struct Allocator<'buf> {
     /// Start of the usable region, aligned for [`BlockHeader`].
@@ -56,7 +54,7 @@ impl<'buf> Allocator<'buf> {
     /// The allocator borrows `data` for as long as it lives, so it cannot
     /// outlive the buffer it hands out pointers into:
     ///
-    /// ```compile_fail
+    /// ```compile_fail,E0597
     /// use optimal_space_allocator::Allocator;
     /// let allocator = {
     ///     let mut buffer = [0u8; 1024];
