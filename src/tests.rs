@@ -1,7 +1,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-use crate::block::{align_up, HEADER};
+use crate::block::{align_up, BlockHeader, HEADER};
 use crate::Allocator;
 
 fn lay(size: usize, align: usize) -> Layout {
@@ -513,3 +513,101 @@ fn from_ptr_constructor() {
 }
 
 
+
+#[test]
+fn unaligned_buffer_is_usable() {
+    // Start one byte into an aligned buffer, so the region itself can never
+    // satisfy BlockHeader's alignment and the allocator must pad past it.
+    let mut buf = AlignedBuffer::<1024>::zeroed();
+    let region = &mut buf.bytes[1..];
+    assert_eq!(region.as_ptr() as usize % align_of::<BlockHeader>(), 1);
+
+    let a = Allocator::new(region);
+    unsafe {
+        let l = lay(64, 8);
+        let p1 = a.alloc(l);
+        let p2 = a.alloc(l);
+        assert!(!p1.is_null());
+        assert!(!p2.is_null());
+        // In debug builds the header accessors assert their own alignment,
+        // so reaching here at all is the guarantee under test.
+        ptr::write_bytes(p1, 0xAB, 64);
+        ptr::write_bytes(p2, 0xCD, 64);
+        assert_eq!(*p1, 0xAB);
+        assert_eq!(*p2, 0xCD);
+        a.dealloc(p1, l);
+        a.dealloc(p2, l);
+    }
+}
+
+#[test]
+fn optimize_space_with_mixed_alignments() {
+    let mut buf = AlignedBuffer::<8192>::zeroed();
+    let a = Allocator::new(&mut buf.bytes);
+    unsafe {
+        let narrow = lay(8, 8);
+        let wide = lay(8, 256);
+        let p1 = a.alloc(narrow);
+        let p2 = a.alloc(narrow);
+        let p3 = a.alloc(wide);
+        assert!(!p3.is_null());
+        ptr::write(p3 as *mut u64, 0xFEED);
+
+        a.dealloc(p1, narrow);
+        a.dealloc(p2, narrow);
+
+        // The 256-aligned block gains little or nothing by sliding left: the
+        // padding it sheds at the front it regains as alignment slack.
+        // Compaction must cope without panicking or corrupting it.
+        let mut new_p3 = p3;
+        a.optimize_space(|old, new| {
+            if old == p3 {
+                new_p3 = new;
+            }
+        });
+
+        assert!(new_p3 as usize <= p3 as usize, "a block must never move right");
+        assert_eq!(ptr::read(new_p3 as *const u64), 0xFEED, "data survives compaction");
+        assert_eq!(new_p3 as usize % 256, 0, "alignment survives compaction");
+        a.dealloc(new_p3, wide);
+    }
+}
+
+#[test]
+fn realloc_beyond_buffer_returns_null() {
+    let mut buf = AlignedBuffer::<1024>::zeroed();
+    let a = Allocator::new(&mut buf.bytes);
+    unsafe {
+        let l = lay(64, 8);
+        let p = a.alloc(l);
+        assert!(!p.is_null());
+        ptr::write_bytes(p, 0xAB, 64);
+
+        assert!(a.realloc(p, l, usize::MAX).is_null(), "a wrapping size must fail");
+        assert!(a.realloc(p, l, 4096).is_null(), "a size past the buffer must fail");
+
+        // A failed realloc must leave the original allocation untouched.
+        assert_eq!(*p, 0xAB);
+        a.dealloc(p, l);
+    }
+}
+
+#[test]
+fn from_ptr_length_comes_from_metadata() {
+    let mut data = [0u8; 1024];
+    let base = data.as_ptr() as usize;
+    // Hand the allocator only the first 128 bytes.
+    let raw: *mut [u8] = &mut data[..128];
+    // SAFETY: `raw` points into `data`, which outlives the allocator, and
+    // nothing else reads or writes those bytes while it lives.
+    let a = unsafe { Allocator::from_ptr(raw) };
+    unsafe {
+        assert!(a.alloc(lay(512, 8)).is_null(), "must not allocate past the region");
+
+        let l = lay(64, 8);
+        let p = a.alloc(l);
+        assert!(!p.is_null());
+        assert!((p as usize) + 64 <= base + 128, "allocation must stay in the region");
+        a.dealloc(p, l);
+    }
+}

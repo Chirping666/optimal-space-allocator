@@ -45,12 +45,11 @@ ordered Critical > Design > Testing.
 
 ## Design
 
-- [x] **`data: *mut [u8]` and `length` are redundant state.** Done alongside
-  the header-alignment fix: storing one aligned `base` plus one `length` is
-  what that fix required. The slice pointer
+- [x] **`data: *mut [u8]` and `length` are redundant state.** The slice pointer
   already carries its length; storing a second copy invites the two to
   disagree. Keep one base pointer and one length, both established in the
-  constructor.
+  constructor. Done alongside the header-alignment fix, which needed exactly
+  that single aligned `base` plus `length`.
 
 - [x] **`alloc`'s best-fit candidate is an anonymous 3-tuple.** `Option<(usize,
   usize, usize)>` with a trailing comment naming the fields is exactly what
@@ -71,13 +70,13 @@ ordered Critical > Design > Testing.
 
 ## Testing
 
-- [ ] Test that an unaligned caller buffer still produces correctly aligned
+- [x] Test that an unaligned caller buffer still produces correctly aligned
   headers and usable allocations.
 
-- [ ] Test compaction with mixed alignments, covering the case where a block
+- [x] Test compaction with mixed alignments, covering the case where a block
   cannot profitably move left.
 
-- [ ] Test that `realloc` with a `new_size` larger than the buffer returns null
+- [x] Test that `realloc` with a `new_size` larger than the buffer returns null
   and leaves the original allocation intact.
 
-- [ ] Test `from_ptr` through its new unsafe contract.
+- [x] Test `from_ptr` through its new unsafe contract.
