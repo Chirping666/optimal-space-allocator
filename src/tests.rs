@@ -1,7 +1,7 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-use crate::block::{align_up, BlockHeader, HEADER};
+use crate::block::{align_up, checked_body_len, BlockHeader, HEADER};
 use crate::Allocator;
 
 fn lay(size: usize, align: usize) -> Layout {
@@ -610,4 +610,20 @@ fn from_ptr_length_comes_from_metadata() {
         assert!((p as usize) + 64 <= base + 128, "allocation must stay in the region");
         a.dealloc(p, l);
     }
+}
+
+#[test]
+fn checked_body_len_rejects_wrapping_alignment() {
+    // A block near the top of the address space, with an `align` big enough
+    // that `raw + align - 1` wraps. The unvetted fit path must call this
+    // "does not fit" — the wrapped result would masquerade as a tiny body
+    // that compares as fitting.
+    let top = usize::MAX - 64;
+    assert_eq!(checked_body_len(top, 0, 8, 0x4000), None);
+
+    // The same request away from the top is fine.
+    assert!(checked_body_len(0x1000, 0, 8, 0x4000).is_some());
+
+    // A size that wraps when padded up also fails rather than wrapping.
+    assert_eq!(checked_body_len(0x1000, 0, usize::MAX - 4, 8), None);
 }

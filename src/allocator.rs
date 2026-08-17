@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 
-use crate::block::{align_up, body_len, BlockHeader, HEADER, NONE};
+use crate::block::{align_up, body_len, checked_body_len, BlockHeader, HEADER, NONE};
 use crate::lock::LockGuard;
 
 /// A candidate position for a new block, as considered by the best-fit search.
@@ -157,7 +157,8 @@ impl<'buf> Allocator<'buf> {
         if gap < HEADER {
             return None;
         }
-        let needed = HEADER + body_len(self.buf() as usize, gap_start, size, align);
+        let body = checked_body_len(self.buf() as usize, gap_start, size, align)?;
+        let needed = HEADER.checked_add(body)?;
         (needed <= gap).then(|| gap - needed)
     }
 
@@ -187,12 +188,18 @@ impl<'buf> Allocator<'buf> {
             // SAFETY: cur is a valid block offset in the allocated list
             let hdr = unsafe { self.get(cur) };
             let end_if_kept = cur + HEADER + body_len(base_addr, cur, hdr.size, hdr.align);
-            let end_if_moved = target + HEADER + body_len(base_addr, target, hdr.size, hdr.align);
 
-            // A block's alignment padding depends on where it sits, so moving
-            // one left can make it *wider* and push its end past where it used
-            // to finish — over the next block. Only move when the extent
-            // genuinely shrinks; otherwise leave the block alone.
+            // A block's alignment padding depends on where it sits, so its
+            // extent must be recomputed at the candidate position. For a block
+            // vetted at `cur`, moving to a smaller offset provably never
+            // widens the extent (the padding it sheds at the front it regains
+            // as at most equal alignment slack) nor wraps the arithmetic
+            // (every intermediate sum is monotonic in the offset), so the
+            // comparison below is defensive: skipping a move is always sound,
+            // and the proof leans on enough invariants that we don't trust it
+            // with memory safety.
+            let end_if_moved = checked_body_len(base_addr, target, hdr.size, hdr.align)
+                .map_or(usize::MAX, |body| target + HEADER + body);
             let moving = target < cur && end_if_moved <= end_if_kept;
 
             if moving {
@@ -333,10 +340,8 @@ unsafe impl GlobalAlloc for Allocator<'_> {
                 if align_up(base_addr + cur + HEADER, hdr.align) == target {
                     // Found the block. Determine the gap end (next block or buffer end).
                     let gap_end = if hdr.next == NONE { len } else { hdr.next };
-                    let new_body = body_len(base_addr, cur, new_size, hdr.align);
-                    let needed = HEADER + new_body;
 
-                    if cur + needed <= gap_end {
+                    if self.waste_in_gap(cur, gap_end, new_size, hdr.align).is_some() {
                         // In-place expansion: just update the stored size.
                         // SAFETY: cur is a valid block offset
                         unsafe {
