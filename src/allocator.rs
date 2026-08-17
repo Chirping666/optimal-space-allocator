@@ -167,8 +167,7 @@ impl<'buf> Allocator<'buf> {
     /// callback. Any pointer not updated becomes dangling.
     pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
         let _guard = self.lock();
-        let base = self.buf();
-        let base_addr = base as usize;
+        let base_addr = self.buf() as usize;
         let mut target: usize = 0;
         let mut prev = NONE;
         // SAFETY: spin lock held — exclusive access
@@ -177,28 +176,25 @@ impl<'buf> Allocator<'buf> {
         while cur != NONE {
             // SAFETY: cur is a valid block offset in the allocated list
             let hdr = unsafe { self.get(cur) };
-            let new_body = body_len(base_addr, target, hdr.size, hdr.align);
+            let end_if_kept = cur + HEADER + body_len(base_addr, cur, hdr.size, hdr.align);
+            let end_if_moved = target + HEADER + body_len(base_addr, target, hdr.size, hdr.align);
 
-            if target < cur {
-                debug_assert!(
-                    target + HEADER + new_body <= cur,
-                    "compacted block at {target}..{} overlaps old block start at {cur}",
-                    target + HEADER + new_body,
-                );
+            // A block's alignment padding depends on where it sits, so moving
+            // one left can make it *wider* and push its end past where it used
+            // to finish — over the next block. Only move when the extent
+            // genuinely shrinks; otherwise leave the block alone.
+            let moving = target < cur && end_if_moved <= end_if_kept;
+
+            if moving {
                 let old_user = align_up(base_addr + cur + HEADER, hdr.align) as *mut u8;
                 let new_user = align_up(base_addr + target + HEADER, hdr.align) as *mut u8;
+                debug_assert!(new_user <= old_user, "compaction must never move a block right");
 
-                // SAFETY: old_user and new_user are within the buffer; ptr::copy handles overlap
+                // SAFETY: both lie inside the buffer and ptr::copy handles overlap
                 unsafe { ptr::copy(old_user, new_user, hdr.size) };
 
                 // SAFETY: target is a valid offset for a header within the buffer
-                unsafe {
-                    self.set(target, BlockHeader {
-                        size: hdr.size,
-                        align: hdr.align,
-                        next: hdr.next,
-                    });
-                }
+                unsafe { self.set(target, hdr) };
 
                 if prev == NONE {
                     // SAFETY: spin lock held — exclusive access
@@ -213,12 +209,10 @@ impl<'buf> Allocator<'buf> {
                 }
 
                 relocate(old_user, new_user);
-                prev = target;
-            } else {
-                prev = cur;
             }
 
-            target = (if target < cur { target } else { cur }) + HEADER + new_body;
+            prev = if moving { target } else { cur };
+            target = if moving { end_if_moved } else { end_if_kept };
             cur = hdr.next;
         }
     }

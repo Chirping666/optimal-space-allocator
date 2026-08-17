@@ -512,3 +512,4 @@ fn from_ptr_constructor() {
     }
 }
 
+

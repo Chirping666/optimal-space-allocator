@@ -26,7 +26,7 @@ ordered Critical > Design > Testing.
   written misaligned). Align the usable region up in the constructor and shrink
   the length accordingly.
 
-- [ ] **`optimize_space` mishandles blocks whose alignment padding grows when
+- [x] **`optimize_space` mishandles blocks whose alignment padding grows when
   they move left.** A block's footprint is `HEADER + align_up(size + padding,
   usize)`, and `padding` depends on the block's offset, so a compacted block
   can need a *larger* footprint at its new home. The `debug_assert!` guarding
