@@ -22,7 +22,9 @@ use crate::lock::LockGuard;
 /// a `static` buffer.
 #[repr(C)]
 pub struct Allocator<'buf> {
-    data: *mut [u8],
+    /// Start of the usable region, aligned for [`BlockHeader`].
+    base: *mut u8,
+    /// Bytes usable from `base`.
     length: usize,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].
     head: UnsafeCell<usize>,
@@ -52,15 +54,7 @@ impl<'buf> Allocator<'buf> {
     /// };
     /// ```
     pub fn new(data: &'buf mut [u8]) -> Self {
-        let length = data.len();
-        let data: *mut [u8] = data;
-        Self {
-            data,
-            length,
-            head: UnsafeCell::new(NONE),
-            lock: AtomicBool::new(false),
-            buffer: PhantomData,
-        }
+        Self::over(data.as_mut_ptr(), data.len())
     }
 
     /// Build an allocator over a raw buffer, for callers that cannot produce
@@ -76,9 +70,28 @@ impl<'buf> Allocator<'buf> {
     /// - Nothing else may read or write that memory while the allocator lives;
     ///   the allocator assumes exclusive access to it.
     pub unsafe fn from_ptr(data: *mut [u8]) -> Self {
+        Self::over(data as *mut u8, data.len())
+    }
+
+    /// Claim the largest `BlockHeader`-aligned region inside `[data, data + length)`.
+    ///
+    /// Every block offset is a multiple of `align_of::<BlockHeader>()` — both
+    /// `HEADER` and every `body_len` are — so aligning the base once is what
+    /// keeps every inline header aligned. A buffer too short to contain even
+    /// the padding yields a zero-length allocator, which simply never fits
+    /// anything.
+    fn over(data: *mut u8, length: usize) -> Self {
+        let padding = align_up(data as usize, align_of::<BlockHeader>()) - data as usize;
+        let (base, length) = match length.checked_sub(padding) {
+            // SAFETY: padding <= length, so `data + padding` lands inside the
+            // buffer or one byte past its end.
+            Some(usable) => (unsafe { data.add(padding) }, usable),
+            None => (data, 0),
+        };
+        debug_assert!(base as usize % align_of::<BlockHeader>() == 0 || length == 0);
         Self {
-            data,
-            length: data.len(),
+            base,
+            length,
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
             buffer: PhantomData,
@@ -90,7 +103,7 @@ impl<'buf> Allocator<'buf> {
     }
 
     fn buf(&self) -> *mut u8 {
-        self.data as *mut u8
+        self.base
     }
 
     unsafe fn head(&self) -> usize {
@@ -107,6 +120,7 @@ impl<'buf> Allocator<'buf> {
         // SAFETY: caller guarantees `off` is a valid header offset within the buffer
         unsafe {
             let p = self.buf().add(off) as *const BlockHeader;
+            debug_assert!(p.is_aligned(), "header read at misaligned offset {off}");
             ptr::read(p)
         }
     }
@@ -115,6 +129,7 @@ impl<'buf> Allocator<'buf> {
         // SAFETY: caller guarantees `off` is a valid header offset within the buffer
         unsafe {
             let p = self.buf().add(off) as *mut BlockHeader;
+            debug_assert!(p.is_aligned(), "header write at misaligned offset {off}");
             ptr::write(p, h);
         }
     }

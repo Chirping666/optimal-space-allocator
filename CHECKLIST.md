@@ -19,7 +19,7 @@ ordered Critical > Design > Testing.
   it `unsafe` with a documented contract, and take the length from the slice
   pointer's own metadata so the two can never disagree.
 
-- [ ] **Block headers can be written at misaligned addresses.** `set`/`get`
+- [x] **Block headers can be written at misaligned addresses.** `set`/`get`
   do `ptr::write`/`ptr::read` of a `BlockHeader` at `base + off`, but nothing
   constrains the caller's `[u8]` buffer to `align_of::<BlockHeader>()`
   (verified: a buffer starting at an address ≡ 2 mod 8 gets its first header
@@ -45,7 +45,9 @@ ordered Critical > Design > Testing.
 
 ## Design
 
-- [ ] **`data: *mut [u8]` and `length` are redundant state.** The slice pointer
+- [x] **`data: *mut [u8]` and `length` are redundant state.** Done alongside
+  the header-alignment fix: storing one aligned `base` plus one `length` is
+  what that fix required. The slice pointer
   already carries its length; storing a second copy invites the two to
   disagree. Keep one base pointer and one length, both established in the
   constructor.

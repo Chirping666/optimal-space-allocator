@@ -8,6 +8,19 @@ fn lay(size: usize, align: usize) -> Layout {
     Layout::from_size_align(size, align).unwrap()
 }
 
+/// A buffer already aligned for `BlockHeader`, so the allocator adds no
+/// leading padding and tests can derive block offsets from its address.
+#[repr(C, align(16))]
+struct AlignedBuffer<const N: usize> {
+    bytes: [u8; N],
+}
+
+impl<const N: usize> AlignedBuffer<N> {
+    fn zeroed() -> Self {
+        Self { bytes: [0u8; N] }
+    }
+}
+
 #[test]
 fn basic_alloc_dealloc() {
     let mut buf = [0u8; 1024];
@@ -102,9 +115,9 @@ fn oom_returns_null() {
 #[test]
 fn free_reclaims_full_space() {
     const BUF: usize = 4096;
-    let mut buf = [0u8; BUF];
-    let base = buf.as_ptr() as usize;
-    let a = Allocator::new(&mut buf);
+    let mut buf = AlignedBuffer::<BUF>::zeroed();
+    let base = buf.bytes.as_ptr() as usize;
+    let a = Allocator::new(&mut buf.bytes);
     unsafe {
         let align = size_of::<usize>();
         let l = lay(64, align);
@@ -345,9 +358,9 @@ fn align_greater_than_size() {
 fn alloc_exactly_fills_buffer() {
     // A tiny buffer that can hold exactly one block.
     const BUF: usize = HEADER + size_of::<usize>();
-    let mut buf = [0u8; BUF];
-    let base = buf.as_ptr() as usize;
-    let a = Allocator::new(&mut buf);
+    let mut buf = AlignedBuffer::<BUF>::zeroed();
+    let base = buf.bytes.as_ptr() as usize;
+    let a = Allocator::new(&mut buf.bytes);
     unsafe {
         let align = size_of::<usize>();
         let raw = base + HEADER;
@@ -445,9 +458,9 @@ fn realloc_invalid_pointer() {
 #[test]
 fn realloc_fills_remaining_gap() {
     const BUF: usize = 4096;
-    let mut buf = [0u8; BUF];
-    let base = buf.as_ptr() as usize;
-    let a = Allocator::new(&mut buf);
+    let mut buf = AlignedBuffer::<BUF>::zeroed();
+    let base = buf.bytes.as_ptr() as usize;
+    let a = Allocator::new(&mut buf.bytes);
     unsafe {
         let l = lay(64, 8);
         let p1 = a.alloc(l);
@@ -498,3 +511,4 @@ fn from_ptr_constructor() {
         a.dealloc(p, l);
     }
 }
+
