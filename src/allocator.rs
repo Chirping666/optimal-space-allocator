@@ -1,5 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 
@@ -14,24 +15,43 @@ use crate::lock::LockGuard;
 ///
 /// Thread safety is provided by an internal spin lock that serialises all
 /// operations on the allocator.
+///
+/// The `'buf` parameter ties the allocator to the buffer it was built from,
+/// so it can never outlive that buffer. Installing one as a
+/// `#[global_allocator]` therefore requires an `Allocator<'static>`, backed by
+/// a `static` buffer.
 #[repr(C)]
-pub struct Allocator {
+pub struct Allocator<'buf> {
     data: *mut [u8],
     length: usize,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].
     head: UnsafeCell<usize>,
     /// Spin lock protecting the buffer and `head`.
     lock: AtomicBool,
+    /// Borrows `'buf` mutably: the buffer is exclusively ours for that long.
+    buffer: PhantomData<&'buf mut [u8]>,
 }
 
 // SAFETY: All mutable access to the buffer and head is guarded by the `lock`
 // spin lock, ensuring mutual exclusion across threads. The raw pointer `data`
 // is only dereferenced under the lock.
-unsafe impl Sync for Allocator {}
-unsafe impl Send for Allocator {}
+unsafe impl Sync for Allocator<'_> {}
+unsafe impl Send for Allocator<'_> {}
 
-impl Allocator {
-    pub fn new(data: &mut [u8]) -> Self {
+impl<'buf> Allocator<'buf> {
+    /// Build an allocator over `data`.
+    ///
+    /// The allocator borrows `data` for as long as it lives, so it cannot
+    /// outlive the buffer it hands out pointers into:
+    ///
+    /// ```compile_fail
+    /// use optimal_space_allocator::Allocator;
+    /// let allocator = {
+    ///     let mut buffer = [0u8; 1024];
+    ///     Allocator::new(&mut buffer)
+    /// };
+    /// ```
+    pub fn new(data: &'buf mut [u8]) -> Self {
         let length = data.len();
         let data: *mut [u8] = data;
         Self {
@@ -39,6 +59,7 @@ impl Allocator {
             length,
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
+            buffer: PhantomData,
         }
     }
 
@@ -48,6 +69,7 @@ impl Allocator {
             length,
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
+            buffer: PhantomData,
         }
     }
 
@@ -175,7 +197,7 @@ impl Allocator {
     }
 }
 
-unsafe impl GlobalAlloc for Allocator {
+unsafe impl GlobalAlloc for Allocator<'_> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _guard = self.lock();
         let size = layout.size();

@@ -5,7 +5,7 @@ ordered Critical > Design > Testing.
 
 ## Critical
 
-- [ ] **`Allocator::new` discards the buffer's lifetime.** `new(&mut [u8])`
+- [x] **`Allocator::new` discards the buffer's lifetime.** `new(&mut [u8])`
   stores a `*mut [u8]` in a struct with no lifetime parameter, so the borrow
   ends at the end of the constructor call. Entirely in safe code, an allocator
   can outlive its buffer and then write into a dead stack frame (verified: an
