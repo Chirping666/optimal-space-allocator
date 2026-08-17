@@ -1,10 +1,21 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 
-use crate::block::{align_up, body_len, BlockHeader, HEADER, NONE};
+use crate::block::{align_up, body_len, checked_body_len, BlockHeader, HEADER, NONE};
 use crate::lock::LockGuard;
+
+/// A candidate position for a new block, as considered by the best-fit search.
+struct Placement {
+    /// Offset the block's header would be written at.
+    offset: usize,
+    /// Offset of the block that would precede it in the list, or [`NONE`].
+    prev: usize,
+    /// Bytes of the gap left unused if the block goes here. Lower is better.
+    waste: usize,
+}
 
 /// Best-fit allocator over a caller-provided byte buffer.
 ///
@@ -14,40 +25,84 @@ use crate::lock::LockGuard;
 ///
 /// Thread safety is provided by an internal spin lock that serialises all
 /// operations on the allocator.
+///
+/// The `'buf` parameter ties the allocator to the buffer it was built from,
+/// so it can never outlive that buffer.
 #[repr(C)]
-pub struct Allocator {
-    data: *mut [u8],
+pub struct Allocator<'buf> {
+    /// Start of the usable region, aligned for [`BlockHeader`].
+    base: *mut u8,
+    /// Bytes usable from `base`.
     length: usize,
     /// Offset of the first allocated block (sorted by position), or [`NONE`].
     head: UnsafeCell<usize>,
     /// Spin lock protecting the buffer and `head`.
     lock: AtomicBool,
+    /// Borrows `'buf` mutably: the buffer is exclusively ours for that long.
+    buffer: PhantomData<&'buf mut [u8]>,
 }
 
 // SAFETY: All mutable access to the buffer and head is guarded by the `lock`
-// spin lock, ensuring mutual exclusion across threads. The raw pointer `data`
+// spin lock, ensuring mutual exclusion across threads. The raw pointer `base`
 // is only dereferenced under the lock.
-unsafe impl Sync for Allocator {}
-unsafe impl Send for Allocator {}
+unsafe impl Sync for Allocator<'_> {}
+unsafe impl Send for Allocator<'_> {}
 
-impl Allocator {
-    pub fn new(data: &mut [u8]) -> Self {
-        let length = data.len();
-        let data: *mut [u8] = data;
-        Self {
-            data,
-            length,
-            head: UnsafeCell::new(NONE),
-            lock: AtomicBool::new(false),
-        }
+impl<'buf> Allocator<'buf> {
+    /// Build an allocator over `data`.
+    ///
+    /// The allocator borrows `data` for as long as it lives, so it cannot
+    /// outlive the buffer it hands out pointers into:
+    ///
+    /// ```compile_fail,E0597
+    /// use optimal_space_allocator::Allocator;
+    /// let allocator = {
+    ///     let mut buffer = [0u8; 1024];
+    ///     Allocator::new(&mut buffer)
+    /// };
+    /// ```
+    pub fn new(data: &'buf mut [u8]) -> Self {
+        Self::over(data.as_mut_ptr(), data.len())
     }
 
-    pub fn from_ptr(data: *mut [u8], length: usize) -> Self {
+    /// Build an allocator over a raw buffer, for callers that cannot produce
+    /// a `&mut [u8]`. Prefer [`Allocator::new`] where one is available.
+    ///
+    /// The usable length is taken from `data`'s own slice metadata, so it can
+    /// never disagree with the region actually pointed to.
+    ///
+    /// # Safety
+    ///
+    /// - `data` must point to `data.len()` bytes of writable memory that stays
+    ///   valid for all of `'buf`.
+    /// - Nothing else may read or write that memory while the allocator lives;
+    ///   the allocator assumes exclusive access to it.
+    pub unsafe fn from_ptr(data: *mut [u8]) -> Self {
+        Self::over(data as *mut u8, data.len())
+    }
+
+    /// Claim the largest `BlockHeader`-aligned region inside `[data, data + length)`.
+    ///
+    /// Every block offset is a multiple of `align_of::<BlockHeader>()` — both
+    /// `HEADER` and every `body_len` are — so aligning the base once is what
+    /// keeps every inline header aligned. A buffer too short to contain even
+    /// the padding yields a zero-length allocator, which simply never fits
+    /// anything.
+    fn over(data: *mut u8, length: usize) -> Self {
+        let padding = align_up(data as usize, align_of::<BlockHeader>()) - data as usize;
+        let (base, length) = match length.checked_sub(padding) {
+            // SAFETY: padding <= length, so `data + padding` lands inside the
+            // buffer or one byte past its end.
+            Some(usable) => (unsafe { data.add(padding) }, usable),
+            None => (data, 0),
+        };
+        debug_assert!((base as usize).is_multiple_of(align_of::<BlockHeader>()) || length == 0);
         Self {
-            data,
+            base,
             length,
             head: UnsafeCell::new(NONE),
             lock: AtomicBool::new(false),
+            buffer: PhantomData,
         }
     }
 
@@ -56,7 +111,7 @@ impl Allocator {
     }
 
     fn buf(&self) -> *mut u8 {
-        self.data as *mut u8
+        self.base
     }
 
     unsafe fn head(&self) -> usize {
@@ -73,6 +128,7 @@ impl Allocator {
         // SAFETY: caller guarantees `off` is a valid header offset within the buffer
         unsafe {
             let p = self.buf().add(off) as *const BlockHeader;
+            debug_assert!(p.is_aligned(), "header read at misaligned offset {off}");
             ptr::read(p)
         }
     }
@@ -81,45 +137,46 @@ impl Allocator {
         // SAFETY: caller guarantees `off` is a valid header offset within the buffer
         unsafe {
             let p = self.buf().add(off) as *mut BlockHeader;
+            debug_assert!(p.is_aligned(), "header write at misaligned offset {off}");
             ptr::write(p, h);
         }
     }
 
-    /// Try to fit `size` bytes at `align` into the gap `[gap_start, gap_end)`.
-    /// Returns `(body_len, waste)` on success.
-    fn fit_gap(
+    /// Bytes that would be left unused after placing `size`/`align` in the gap
+    /// `[gap_start, gap_end)`, or `None` if the block does not fit.
+    fn waste_in_gap(
         &self,
         gap_start: usize,
         gap_end: usize,
         size: usize,
         align: usize,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<usize> {
         let gap = gap_end.checked_sub(gap_start)?;
         if gap < HEADER {
             return None;
         }
-        let body = body_len(self.buf() as usize, gap_start, size, align);
-        let needed = HEADER + body;
-        debug_assert!(
-            gap_start + needed <= gap_end || needed > gap,
-            "fitted block at {gap_start}..{} must not exceed gap end {gap_end}",
-            gap_start + needed,
-        );
-        (needed <= gap).then(|| (body, gap - needed))
+        let body = checked_body_len(self.buf() as usize, gap_start, size, align)?;
+        let needed = HEADER.checked_add(body)?;
+        (needed <= gap).then(|| gap - needed)
     }
 
-    /// Compact all allocated blocks toward the start of the buffer,
-    /// eliminating fragmentation. Calls `relocate(old_ptr, new_ptr)` for
-    /// every block whose user pointer changed.
+    /// Compact allocated blocks toward the start of the buffer, reclaiming the
+    /// gaps between them.
+    ///
+    /// `relocate(old_ptr, new_ptr)` reports every block that moves. A block
+    /// whose alignment padding absorbs the shift is reported with
+    /// `old_ptr == new_ptr`; a block that cannot move left without growing
+    /// stays put and is not reported at all.
     ///
     /// # Safety
     ///
-    /// The caller must update **all** live pointers via the `relocate`
-    /// callback. Any pointer not updated becomes dangling.
+    /// - The caller must update **all** live pointers via the `relocate`
+    ///   callback. Any pointer left un-updated becomes dangling.
+    /// - `relocate` runs with the allocator's lock held, so it must not call
+    ///   back into the allocator. Doing so deadlocks.
     pub unsafe fn optimize_space(&self, mut relocate: impl FnMut(*mut u8, *mut u8)) {
         let _guard = self.lock();
-        let base = self.buf();
-        let base_addr = base as usize;
+        let base_addr = self.buf() as usize;
         let mut target: usize = 0;
         let mut prev = NONE;
         // SAFETY: spin lock held — exclusive access
@@ -128,28 +185,31 @@ impl Allocator {
         while cur != NONE {
             // SAFETY: cur is a valid block offset in the allocated list
             let hdr = unsafe { self.get(cur) };
-            let new_body = body_len(base_addr, target, hdr.size, hdr.align);
+            let end_if_kept = cur + HEADER + body_len(base_addr, cur, hdr.size, hdr.align);
 
-            if target < cur {
-                debug_assert!(
-                    target + HEADER + new_body <= cur,
-                    "compacted block at {target}..{} overlaps old block start at {cur}",
-                    target + HEADER + new_body,
-                );
+            // A block's alignment padding depends on where it sits, so its
+            // extent must be recomputed at the candidate position. For a block
+            // vetted at `cur`, moving to a smaller offset provably never
+            // widens the extent (the padding it sheds at the front it regains
+            // as at most equal alignment slack) nor wraps the arithmetic
+            // (every intermediate sum is monotonic in the offset), so the
+            // comparison below is defensive: skipping a move is always sound,
+            // and the proof leans on enough invariants that we don't trust it
+            // with memory safety.
+            let end_if_moved = checked_body_len(base_addr, target, hdr.size, hdr.align)
+                .map_or(usize::MAX, |body| target + HEADER + body);
+            let moving = target < cur && end_if_moved <= end_if_kept;
+
+            if moving {
                 let old_user = align_up(base_addr + cur + HEADER, hdr.align) as *mut u8;
                 let new_user = align_up(base_addr + target + HEADER, hdr.align) as *mut u8;
+                debug_assert!(new_user <= old_user, "compaction must never move a block right");
 
-                // SAFETY: old_user and new_user are within the buffer; ptr::copy handles overlap
+                // SAFETY: both lie inside the buffer and ptr::copy handles overlap
                 unsafe { ptr::copy(old_user, new_user, hdr.size) };
 
                 // SAFETY: target is a valid offset for a header within the buffer
-                unsafe {
-                    self.set(target, BlockHeader {
-                        size: hdr.size,
-                        align: hdr.align,
-                        next: hdr.next,
-                    });
-                }
+                unsafe { self.set(target, hdr) };
 
                 if prev == NONE {
                     // SAFETY: spin lock held — exclusive access
@@ -164,18 +224,16 @@ impl Allocator {
                 }
 
                 relocate(old_user, new_user);
-                prev = target;
-            } else {
-                prev = cur;
             }
 
-            target = (if target < cur { target } else { cur }) + HEADER + new_body;
+            prev = if moving { target } else { cur };
+            target = if moving { end_if_moved } else { end_if_kept };
             cur = hdr.next;
         }
     }
 }
 
-unsafe impl GlobalAlloc for Allocator {
+unsafe impl GlobalAlloc for Allocator<'_> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let _guard = self.lock();
         let size = layout.size();
@@ -183,8 +241,14 @@ unsafe impl GlobalAlloc for Allocator {
         let base = self.buf();
         let len = self.length;
 
-        let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
-        let mut best_waste = usize::MAX;
+        // A block costs a header plus padding on top of `size`, so anything
+        // larger than the whole buffer is hopeless. Rejecting it here also
+        // keeps `size + padding` in `body_len` well clear of wrapping.
+        if size > len {
+            return ptr::null_mut();
+        }
+
+        let mut best: Option<Placement> = None;
 
         let mut prev = NONE;
         let mut gap_start: usize = 0;
@@ -192,13 +256,12 @@ unsafe impl GlobalAlloc for Allocator {
         let mut cur = unsafe { self.head() };
 
         while cur != NONE {
-            if let Some((body, waste)) = self.fit_gap(gap_start, cur, size, align) {
-                if waste < best_waste {
-                    best = Some((gap_start, prev, body));
-                    best_waste = waste;
-                    if waste == 0 {
-                        break;
-                    }
+            if let Some(waste) = self.waste_in_gap(gap_start, cur, size, align)
+                && best.as_ref().is_none_or(|best| waste < best.waste)
+            {
+                best = Some(Placement { offset: gap_start, prev, waste });
+                if waste == 0 {
+                    break;
                 }
             }
 
@@ -209,17 +272,15 @@ unsafe impl GlobalAlloc for Allocator {
             cur = hdr.next;
         }
 
-        if let Some((body, waste)) = self.fit_gap(gap_start, len, size, align) {
-            if waste < best_waste {
-                best = Some((gap_start, prev, body));
-            }
+        // The trailing gap, between the last allocated block and the buffer end.
+        if let Some(waste) = self.waste_in_gap(gap_start, len, size, align)
+            && best.as_ref().is_none_or(|best| waste < best.waste)
+        {
+            best = Some(Placement { offset: gap_start, prev, waste });
         }
 
-        let (gap, prev, _body) = match best {
-            Some(b) => b,
-            None => {
-                return ptr::null_mut();
-            }
+        let Some(Placement { offset: gap, prev, .. }) = best else {
+            return ptr::null_mut();
         };
 
         let next = if prev == NONE {
@@ -254,6 +315,14 @@ unsafe impl GlobalAlloc for Allocator {
             return ptr::null_mut();
         }
 
+        // `new_size` is an arbitrary `usize` here, unlike a `Layout`'s size.
+        // A request larger than the buffer can never be satisfied, and letting
+        // it reach `body_len` risks wrapping into a small block. The original
+        // allocation stays untouched, as a failed realloc must leave it.
+        if new_size > self.length {
+            return ptr::null_mut();
+        }
+
         {
             let _guard = self.lock();
             let base = self.buf();
@@ -269,10 +338,8 @@ unsafe impl GlobalAlloc for Allocator {
                 if align_up(base_addr + cur + HEADER, hdr.align) == target {
                     // Found the block. Determine the gap end (next block or buffer end).
                     let gap_end = if hdr.next == NONE { len } else { hdr.next };
-                    let new_body = body_len(base_addr, cur, new_size, hdr.align);
-                    let needed = HEADER + new_body;
 
-                    if cur + needed <= gap_end {
+                    if self.waste_in_gap(cur, gap_end, new_size, hdr.align).is_some() {
                         // In-place expansion: just update the stored size.
                         // SAFETY: cur is a valid block offset
                         unsafe {
