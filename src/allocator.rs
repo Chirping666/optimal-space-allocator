@@ -7,6 +7,16 @@ use core::sync::atomic::AtomicBool;
 use crate::block::{align_up, body_len, BlockHeader, HEADER, NONE};
 use crate::lock::LockGuard;
 
+/// A candidate position for a new block, as considered by the best-fit search.
+struct Placement {
+    /// Offset the block's header would be written at.
+    offset: usize,
+    /// Offset of the block that would precede it in the list, or [`NONE`].
+    prev: usize,
+    /// Bytes of the gap left unused if the block goes here. Lower is better.
+    waste: usize,
+}
+
 /// Best-fit allocator over a caller-provided byte buffer.
 ///
 /// Only *allocated* blocks carry inline [`BlockHeader`]s, kept sorted by
@@ -88,7 +98,7 @@ impl<'buf> Allocator<'buf> {
             Some(usable) => (unsafe { data.add(padding) }, usable),
             None => (data, 0),
         };
-        debug_assert!(base as usize % align_of::<BlockHeader>() == 0 || length == 0);
+        debug_assert!((base as usize).is_multiple_of(align_of::<BlockHeader>()) || length == 0);
         Self {
             base,
             length,
@@ -134,27 +144,21 @@ impl<'buf> Allocator<'buf> {
         }
     }
 
-    /// Try to fit `size` bytes at `align` into the gap `[gap_start, gap_end)`.
-    /// Returns `(body_len, waste)` on success.
-    fn fit_gap(
+    /// Bytes that would be left unused after placing `size`/`align` in the gap
+    /// `[gap_start, gap_end)`, or `None` if the block does not fit.
+    fn waste_in_gap(
         &self,
         gap_start: usize,
         gap_end: usize,
         size: usize,
         align: usize,
-    ) -> Option<(usize, usize)> {
+    ) -> Option<usize> {
         let gap = gap_end.checked_sub(gap_start)?;
         if gap < HEADER {
             return None;
         }
-        let body = body_len(self.buf() as usize, gap_start, size, align);
-        let needed = HEADER + body;
-        debug_assert!(
-            gap_start + needed <= gap_end || needed > gap,
-            "fitted block at {gap_start}..{} must not exceed gap end {gap_end}",
-            gap_start + needed,
-        );
-        (needed <= gap).then(|| (body, gap - needed))
+        let needed = HEADER + body_len(self.buf() as usize, gap_start, size, align);
+        (needed <= gap).then(|| gap - needed)
     }
 
     /// Compact all allocated blocks toward the start of the buffer,
@@ -233,8 +237,7 @@ unsafe impl GlobalAlloc for Allocator<'_> {
             return ptr::null_mut();
         }
 
-        let mut best: Option<(usize, usize, usize)> = None; // (gap_start, prev, body_len)
-        let mut best_waste = usize::MAX;
+        let mut best: Option<Placement> = None;
 
         let mut prev = NONE;
         let mut gap_start: usize = 0;
@@ -242,13 +245,12 @@ unsafe impl GlobalAlloc for Allocator<'_> {
         let mut cur = unsafe { self.head() };
 
         while cur != NONE {
-            if let Some((body, waste)) = self.fit_gap(gap_start, cur, size, align) {
-                if waste < best_waste {
-                    best = Some((gap_start, prev, body));
-                    best_waste = waste;
-                    if waste == 0 {
-                        break;
-                    }
+            if let Some(waste) = self.waste_in_gap(gap_start, cur, size, align)
+                && best.as_ref().is_none_or(|best| waste < best.waste)
+            {
+                best = Some(Placement { offset: gap_start, prev, waste });
+                if waste == 0 {
+                    break;
                 }
             }
 
@@ -259,17 +261,15 @@ unsafe impl GlobalAlloc for Allocator<'_> {
             cur = hdr.next;
         }
 
-        if let Some((body, waste)) = self.fit_gap(gap_start, len, size, align) {
-            if waste < best_waste {
-                best = Some((gap_start, prev, body));
-            }
+        // The trailing gap, between the last allocated block and the buffer end.
+        if let Some(waste) = self.waste_in_gap(gap_start, len, size, align)
+            && best.as_ref().is_none_or(|best| waste < best.waste)
+        {
+            best = Some(Placement { offset: gap_start, prev, waste });
         }
 
-        let (gap, prev, _body) = match best {
-            Some(b) => b,
-            None => {
-                return ptr::null_mut();
-            }
+        let Some(Placement { offset: gap, prev, .. }) = best else {
+            return ptr::null_mut();
         };
 
         let next = if prev == NONE {

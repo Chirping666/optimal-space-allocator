@@ -52,7 +52,7 @@ ordered Critical > Design > Testing.
   disagree. Keep one base pointer and one length, both established in the
   constructor.
 
-- [ ] **`alloc`'s best-fit candidate is an anonymous 3-tuple.** `Option<(usize,
+- [x] **`alloc`'s best-fit candidate is an anonymous 3-tuple.** `Option<(usize,
   usize, usize)>` with a trailing comment naming the fields is exactly what
   CLAUDE.md's "named types over tuples" rule exists to prevent. Introduce a
   named struct.
@@ -65,7 +65,8 @@ ordered Critical > Design > Testing.
   target } else { cur }) + HEADER + new_body` re-derives the block's position
   after the fact instead of naming it.
 
-- [ ] **Clear the two `clippy::collapsible_if` warnings in `alloc`.**
+- [x] **Clear the two `clippy::collapsible_if` warnings in `alloc`.** Both
+  became let-chains as part of the `Placement` rewrite.
 
 ## Testing
 
