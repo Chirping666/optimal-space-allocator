@@ -45,7 +45,7 @@ pub struct Allocator<'buf> {
 }
 
 // SAFETY: All mutable access to the buffer and head is guarded by the `lock`
-// spin lock, ensuring mutual exclusion across threads. The raw pointer `data`
+// spin lock, ensuring mutual exclusion across threads. The raw pointer `base`
 // is only dereferenced under the lock.
 unsafe impl Sync for Allocator<'_> {}
 unsafe impl Send for Allocator<'_> {}
